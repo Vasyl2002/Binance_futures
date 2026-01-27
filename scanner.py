@@ -84,13 +84,13 @@ LIQ_IMB_MIN = 0.60            # imbalance (buy vs sell) to be directional
 # ===== MOMO / IMPULSE (fast movers, no compression needed) =====
 MOMO_LOOKBACK_SEC = 120          # смотрим импульс за 2 минуты
 MOMO_CONFIRM_SEC = 20            # подтверждение что импульс “сейчас продолжается”
-MOMO_MIN_MOVE_PCT = 3.0          # минимум % за LOOKBACK
+MOMO_MIN_MOVE_PCT =2.0          # минимум % за LOOKBACK
 MOMO_CONFIRM_MIN_PCT = 0.6       # минимум % за CONFIRM (в ту же сторону)
 
 MOMO_VOL_SHORT_SEC = 10
 MOMO_VOL_LONG_SEC = 180
-MOMO_VOL_ACCEL_THRESH = 6.0
-MOMO_VOL_MIN_NOW = 200.0         # это “плотность” объёма, подстрой под себя
+MOMO_VOL_ACCEL_THRESH = 3.5
+MOMO_VOL_MIN_NOW = 150.0         # это “плотность” объёма, подстрой под себя
 MOMO_VOL_MIN_BASE = 10.0
 
 MOMO_TAKER_LONG_MIN = 1.10
@@ -98,6 +98,13 @@ MOMO_TAKER_SHORT_MAX = 0.90
 
 MOMO_LIQ_WINDOW_SEC = 30
 MOMO_COOLDOWN_SEC = 120          # анти-спам на 1 символ
+
+# вверху scanner.py (рядом с остальными конфигами)
+MOMO_POINTS = 18              # сколько последних апдейтов цены анализируем
+MOMO_MIN_MOVE_PCT = 2.5       # для “пампа” подними 2.0–4.0
+MOMO_VOL_ACCEL_THRESH = 6.0
+MOMO_VOL_MIN_NOW = 500.0      # USDT за short окно (подстрой)
+MOMO_COOLDOWN_SEC = 120
 
 
 # --- Optional extra confirm signals ---
@@ -146,21 +153,20 @@ def fmt_funding(fr: float) -> str:
     # funding is fraction (e.g. 0.0001 == 0.01%)
     return f"{fr*100:.4f}%"
 
-def cached_latest(ring) -> float | None:
-    """Return last value from a Ring-like object, or None."""
+def cached_latest(ring, default=0.0):
     if ring is None:
-        return None
+        return default
     try:
         vals = ring.values()
         if not vals:
-            return None
-        # vals are (ts, value) or [value]; handle both
+            return default
         last = vals[-1]
-        if isinstance(last, (tuple, list)) and len(last) >= 2:
-            return float(last[1])
-        return float(last)
+        if isinstance(last, (tuple, list)) and len(last) == 2:
+            return last[1]
+        return last
     except Exception:
-        return None
+        return default
+
 
 def fmt_float_opt(x: float | None, digits: int = 2) -> str:
     return "na" if x is None else f"{x:.{digits}f}"
@@ -516,53 +522,81 @@ class Scanner:
         self.stats.reset()
 
     def _momo_impulse(self, sym: str, st, now: float):
-        pts = ring_window_prices(st.price, MOMO_LOOKBACK_SEC, now)
-        if len(pts) < 10:
+        last_ts = float(getattr(st, "momo_last_ts", 0.0))
+        if now - last_ts < MOMO_COOLDOWN_SEC:
             return (False, "", 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
-        p0 = float(pts[0][1])
-        p1 = float(pts[-1][1])
-        move_pct = _pct_move(p0, p1)
+        pts = ring_window_prices(st.price, MOMO_LOOKBACK_SEC, now)
+        if len(pts) < 8:
+            return (False, "", 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+        p0 = pts[0][1]
+        p1 = pts[-1][1]
+
+        if p0 <= 0:
+            return (False, "", 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+
+        move_pct = (p1 / p0 - 1.0) * 100.0
+
         if abs(move_pct) < MOMO_MIN_MOVE_PCT:
             return (False, "", move_pct, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
-        bias = "LONG" if move_pct > 0 else "SHORT"
+        
+                # confirm: импульс должен продолжаться "прямо сейчас"
+        cpts = ring_window_prices(st.price, MOMO_CONFIRM_SEC, now)
+        if len(cpts) >= 4:
+            c0 = cpts[0][1]
+            c1 = cpts[-1][1]
+            if c0 > 0:
+                c_move = (c1 / c0 - 1.0) * 100.0
+                if move_pct > 0 and c_move < MOMO_CONFIRM_MIN_PCT:
+                    return (False, "", move_pct, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+                if move_pct < 0 and c_move > -MOMO_CONFIRM_MIN_PCT:
+                    return (False, "", move_pct, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
-        conf = ring_window_prices(st.price, MOMO_CONFIRM_SEC, now)
-        if len(conf) >= 6:
-            c0 = float(conf[0][1])
-            c1 = float(conf[-1][1])
-            conf_move = _pct_move(c0, c1)
-            if bias == "LONG" and conf_move < MOMO_CONFIRM_MIN_PCT:
+        
+        # anti-chase: если уже откатили от локального пика/дна — не шлём
+        vals = [v for _, v in pts]  # <-- цены из твоего time-window
+        window = vals[-MOMO_POINTS:] if len(vals) >= MOMO_POINTS else vals
+        hi = max(window)
+        lo = min(window)
+
+        if move_pct > 0:
+            dd = (hi - p1) / hi * 100.0 if hi > 0 else 0.0
+            if dd >= 0.35:   # откат от локального хая
                 return (False, "", move_pct, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
-            if bias == "SHORT" and conf_move > -MOMO_CONFIRM_MIN_PCT:
+        else:
+            bounce = (p1 - lo) / lo * 100.0 if lo > 0 else 0.0
+            if bounce >= 0.35:  # отскок от локального дна
                 return (False, "", move_pct, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
+
+
+        # volume accel (у тебя volume ring, судя по всему, time-based и работает)
         ok_vol, accel, v_now, v_base = volume_acceleration_time(
             st.volume,
-            short_sec=MOMO_VOL_SHORT_SEC,
-            long_sec=MOMO_VOL_LONG_SEC,
+            short_sec=10,
+            long_sec=180,
             accel_thresh=MOMO_VOL_ACCEL_THRESH,
             min_now=MOMO_VOL_MIN_NOW,
-            min_base=MOMO_VOL_MIN_BASE,
+            min_base=10.0,
             accel_cap=VOL_ACCEL_CAP,
         )
         if not ok_vol:
             return (False, "", move_pct, accel, v_now, v_base, 1.0, 0.0, 0.0)
 
-        taker_raw = cached_latest(getattr(st, "taker_ratio", None))
-        taker = float(taker_raw) if taker_raw is not None else 1.0
-        if bias == "LONG" and taker < MOMO_TAKER_LONG_MIN:
-            return (False, "", move_pct, accel, v_now, v_base, taker, 0.0, 0.0)
-        if bias == "SHORT" and taker > MOMO_TAKER_SHORT_MAX:
-            return (False, "", move_pct, accel, v_now, v_base, taker, 0.0, 0.0)
+        # taker/basis/liqs (берём кэш)
+        taker = float(cached_latest(getattr(st, "taker_ratio", None), default=1.0))
+        basis = float(cached_latest(getattr(st, "basis", None), default=0.0))
+        liq_total = float(getattr(st, "liq_60s_usdt", 0.0))  # или как у тебя поле называется
 
-        basis_raw = cached_latest(getattr(st, "basis", None))
-        basis = float(basis_raw) if basis_raw is not None else 0.0
-        liq_total, liq_imb, _, _ = self._liq_window_stats(sym, st, now, sec=MOMO_LIQ_WINDOW_SEC)
+        st.momo_last_ts = now
+        side = "LONG" if move_pct > 0 else "SHORT"
+        tag = "MOMO_UP" if side == "LONG" else "MOMO_DOWN"
 
-        tag = "MOMO_UP" if bias == "LONG" else "MOMO_DOWN"
-        return (True, tag, move_pct, accel, v_now, v_base, taker, basis, liq_total)    
+        return (True, tag, move_pct, accel, v_now, v_base, taker, basis, liq_total)
+
+        
 
     # ---------- Liquidation tracking ----------
     def _liq_deque(self, st) -> deque:
@@ -732,21 +766,27 @@ class Scanner:
     
 
     # ---------- Telegram gating ----------
-    def _should_send_tg(self, level: str, tag_out: str, oi_pct: float, sp_vr: float, liq_total: float) -> bool:
+    def _should_send_tg(self, level: str, tag: str, oi_pct: float, sp_vr: float, liq_total: float) -> bool:
 
         if not self.tg_enabled:
             return False
+        
+        if tag.startswith("MOMO"):
+            return True
+        
+        if tag.startswith("FADE"):
+            return True
 
         # Сигналы "высокого доверия" — шлём всегда (но анти-спам/rl всё равно сработает ниже по коду)
-        if tag_out.startswith("SQUEEZE") or tag_out.startswith("LIQ"):
+        if tag.startswith("SQUEEZE") or tag.startswith("LIQ"):
             return True
 
         # Breakout + удержание уровня — это как раз то, ради чего сканер нужен
-        if tag_out.startswith("BREAKOUT_HOLD"):
+        if tag.startswith("BREAKOUT_HOLD"):
             return True
 
                 # For breakouts: allow HOT/VERY_HOT if there's "fuel"
-        if tag_out.startswith("BREAKOUT") and level in ("HOT", "VERY_HOT"):
+        if tag.startswith("BREAKOUT") and level in ("HOT", "VERY_HOT"):
             if abs(oi_pct) >= 1.2 or sp_vr >= 4.0 or liq_total >= (LIQ_MIN_USDT * 1.2):
                 return True
 
@@ -775,6 +815,7 @@ class Scanner:
                     print("[TG] startup ping sent")
                 except Exception as e:
                     print(f"[TG] startup ping error: {e!r}")
+                    print(f"[TG] send failed: {e}")
             while True:
                 await asyncio.sleep(INTERVAL_SEC)
                 self._print_stats_if_due()
@@ -816,28 +857,74 @@ class Scanner:
                     # --- MOMO / IMPULSE (ловим сильные пампы/дампы без compression) ---
                     momo_ok, momo_tag, momo_move, momo_accel, momo_v_now, momo_v_base, momo_taker, momo_basis, momo_liq_total = self._momo_impulse(sym, st, now)
                     if momo_ok:
+                        p24h = float(getattr(st, "p24h", 0.0))
+
+                        momo_taker = cached_latest(getattr(st, "taker_ratio", None), default=None)
+                        momo_basis = cached_latest(getattr(st, "basis", None), default=None)
+
+                        if momo_taker is None:
+                            momo_taker = await self._get_taker_ratio(http, sym)
+                        if momo_basis is None:
+                            momo_basis = await self._get_basis_pct(http, sym)
+
+                        momo_taker = float(momo_taker)
+                        momo_basis = float(momo_basis)
+
+
+                        msg = (
+                            f"{sym} VERY_HOT {momo_tag}({ 'LONG' if momo_move>0 else 'SHORT' }) | "
+                            f"move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | vol_accel={momo_accel:.2f}x | "
+                            f"v_now={momo_v_now:.1f} v_base={momo_v_base:.1f} | "
+                            f"liq={momo_liq_total/1000:.0f}K | taker={momo_taker:.2f} basis={momo_basis:+.3f}% | p24h={p24h:.2f}%"
+                        )
+                        print(msg)
+
+                        rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
+                        signals.append((rank, msg))
+
+                        continue
+
+                    # --- remember peak after MOMO_UP (for FADE) ---
+                    if momo_ok and momo_tag == "MOMO_UP":
+                        st.momo_peak_price = prices[-1]
+                        st.momo_peak_ts = now
+
+                    if momo_ok:
                         last_ts = float(getattr(st, "momo_last_ts", 0.0))
                         if now - last_ts >= MOMO_COOLDOWN_SEC:
                             st.momo_last_ts = now
 
+
+                    # --- FADE after pump (short) ---
+                    # --- FADE after pump (short) ---
+                    peak = float(getattr(st, "momo_peak_price", 0.0))
+                    peak_ts = float(getattr(st, "momo_peak_ts", 0.0))
+
+                    if peak > 0.0 and (now - peak_ts) <= 300 and len(prices) >= 2:
+                        last = float(prices[-1])
+
+                    # обновляем пик, если цена делает новый хай
+                        if last > peak:
+                            st.momo_peak_price = last
+                            st.momo_peak_ts = now
+                        else:
+                        # откат от пика в %
+                            retr = (peak - last) / peak * 100.0
+
+                            taker = float(cached_latest(getattr(st, "taker_ratio", None), default=1.0))
+                            basis = float(cached_latest(getattr(st, "basis", None), default=0.0))
+
+                            if retr >= 1.5 and taker <= 0.75 and basis < 0:
+                                msg = f"{sym} VERY_HOT FADE_SHORT | retr={retr:.2f}% | taker={taker:.2f} basis={basis:+.3f}%"
+                                print(msg)
+                                signals.append((120.0 + retr, msg))
+                                st.momo_peak_price = 0.0  # чтобы не спамило
+
+
+
+
                     # добавляем в кандидаты, чтобы дальше OI/funding могли подтянуться
                             self.book.upsert(sym, 95.0 + clamp(abs(momo_move), 0.0, 20.0))
-
-                            p24h = float(getattr(st, "p24h", 0.0))
-                            msg = (
-                                f"{sym} VERY_HOT {momo_tag}({ 'LONG' if momo_move>0 else 'SHORT' }) | "
-                                f"move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | vol_accel={momo_accel:.2f}x | "
-                                f"v_now={momo_v_now:.1f} v_base={momo_v_base:.1f} | "
-                                f"liq={momo_liq_total/1000:.0f}K | taker={momo_taker:.2f} basis={momo_basis:+.3f}% | p24h={p24h:.2f}%"
-                            )
-                            print(msg)
-
-                    # в TG отправляем через общий механизм top-N
-                            rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
-                            signals.append((rank, msg))
-
-                    # не пускаем MOMO-символ дальше в “SETUP compression”, он всё равно обычно не проходит
-                        continue
 
 
                     ok_price, rng = price_compression(prices)
@@ -941,6 +1028,17 @@ class Scanner:
                     if len(prices) < SETUP_MIN_PRICE_POINTS:
                         self.stats.s2_few_prices += 1
                         continue
+
+                    momo_ok, momo_tag, momo_move, momo_accel, momo_v_now, momo_v_base, momo_taker, momo_basis, momo_liq_total = self._momo_impulse(sym, st, now)
+
+                    if momo_ok:
+                        level = "VERY_HOT"
+                        tag_out = momo_tag
+                    # собери msg в том же формате что остальные (добавь momo_* поля)
+                    # и дальше пусть идёт в твой signals.append(...) + should_send_tg(...)
+
+                    
+
 
                     ok_price, rng = price_compression(prices)
                     if not ok_price:
@@ -1100,10 +1198,10 @@ class Scanner:
                     )
                     print(msg)
 
-                    if self._should_send_tg(level, tag_out=tag_out, oi_pct=oi_pct, sp_vr=sp_vr, liq_total=liq_total):
+                    if self._should_send_tg(level, tag=tag_out, oi_pct=oi_pct, sp_vr=sp_vr, liq_total=liq_total):
                         rank = setup_score
                         if tag_out.startswith("MOMO"):
-                            return True
+                            rank += 25.0
                         if tag_out.startswith("SQUEEZE"):
                             rank += 30.0
                         if tag_out.startswith("LIQ"):
