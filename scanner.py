@@ -856,6 +856,17 @@ class Scanner:
 
                     # --- MOMO / IMPULSE (ловим сильные пампы/дампы без compression) ---
                     momo_ok, momo_tag, momo_move, momo_accel, momo_v_now, momo_v_base, momo_taker, momo_basis, momo_liq_total = self._momo_impulse(sym, st, now)
+                    best = float(getattr(st, "momo_best_abs", 0.0))
+                    best_ts = float(getattr(st, "momo_best_ts", 0.0))
+                    cur = abs(momo_move)
+
+                    # если не улучшилось хотя бы на 0.6% за 3 минуты — не шлём снова
+                    if cur < best + 0.6 and (now - best_ts) < 180:
+                        continue
+
+                    st.momo_best_abs = cur
+                    st.momo_best_ts = now
+
                     if momo_ok:
                         p24h = float(getattr(st, "p24h", 0.0))
 
@@ -870,17 +881,54 @@ class Scanner:
                         momo_taker = float(momo_taker)
                         momo_basis = float(momo_basis)
 
+                        # --- MOMO quality / manual-check hints ---
+                        warn = []
+
+                            # 1) alignment checks (если данные есть)
+                        if momo_move > 0:
+                            if momo_taker < 1.0:
+                                warn.append("taker<1 (sell pressure)")
+                            if momo_basis < -BASIS_MIN_ABS_PCT:
+                                warn.append("basis<0 (fut weak)")
+                        else:
+                            if momo_taker > 1.0:
+                                warn.append("taker>1 (buy pressure)")
+                            if momo_basis > BASIS_MIN_ABS_PCT:
+                                warn.append("basis>0 (fut strong)")
+
+                        # 2) "late" check: откат от локального экстремума внутри окна
+                        pts = ring_window_prices(st.price, MOMO_LOOKBACK_SEC, now)
+                        vals = [v for _, v in pts] if pts else []
+                        if len(vals) >= 8:
+                            hi = max(vals); lo = min(vals); last = vals[-1]
+                            if momo_move > 0 and hi > 0:
+                                dd = (hi - last) / hi * 100.0
+                                if dd >= 0.35:
+                                    warn.append(f"pullback {dd:.2f}% (late)")
+                            if momo_move < 0 and lo > 0:
+                                bounce = (last - lo) / lo * 100.0
+                                if bounce >= 0.35:
+                                    warn.append(f"bounce {bounce:.2f}% (late)")
+
+                        hint = "OK" if not warn else ("CHECK: " + ", ".join(warn))
+
+
 
                         msg = (
                             f"{sym} VERY_HOT {momo_tag}({ 'LONG' if momo_move>0 else 'SHORT' }) | "
                             f"move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | vol_accel={momo_accel:.2f}x | "
                             f"v_now={momo_v_now:.1f} v_base={momo_v_base:.1f} | "
                             f"liq={momo_liq_total/1000:.0f}K | taker={momo_taker:.2f} basis={momo_basis:+.3f}% | p24h={p24h:.2f}%"
+                            f" | {hint}"
                         )
                         print(msg)
 
                         rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
-                        signals.append((rank, msg))
+                        # if conflicting/late -> don't spam TG unless it's VERY strong
+                        send_to_tg = (not warn) or (abs(momo_move) >= 4.5 and momo_accel >= 10.0)
+
+                        if send_to_tg:
+                            signals.append((rank, msg))
 
                         continue
 
