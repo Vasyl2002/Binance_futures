@@ -79,18 +79,24 @@ LIQ_WS_URL = "wss://fstream.binance.com/ws/!forceOrder@arr"
 LIQ_DEQUE_MAX = 800
 LIQ_WINDOW_SEC = 45
 LIQ_MIN_USDT = 150_000.0      # total liq notional in window (tune)
-LIQ_IMB_MIN = 0.60            # imbalance (buy vs sell) to be directional
+LIQ_IMB_MIN = 0.60
+LIQ_CLUSTER_BUCKET_PCT = 0.5
+LIQ_NEAR_CLUSTER_PCT = 0.6
 
-# ===== MOMO / IMPULSE (fast movers, no compression needed) =====
+# --- p24h filters (after bias) ---
+MAX_P24H_UP_PCT = 8.0
+MAX_P24H_DOWN_PCT = 15.0
+
+# ===== MOMO / IMPULSE =====
 MOMO_LOOKBACK_SEC = 120          # смотрим импульс за 2 минуты
 MOMO_CONFIRM_SEC = 20            # подтверждение что импульс “сейчас продолжается”
-MOMO_MIN_MOVE_PCT =2.0          # минимум % за LOOKBACK
+MOMO_MIN_MOVE_PCT = 2.5
 MOMO_CONFIRM_MIN_PCT = 0.6       # минимум % за CONFIRM (в ту же сторону)
 
 MOMO_VOL_SHORT_SEC = 10
 MOMO_VOL_LONG_SEC = 180
-MOMO_VOL_ACCEL_THRESH = 3.5
-MOMO_VOL_MIN_NOW = 150.0         # это “плотность” объёма, подстрой под себя
+MOMO_VOL_ACCEL_THRESH = 6.0
+MOMO_VOL_MIN_NOW = 500.0         # это “плотность” объёма, подстрой под себя
 MOMO_VOL_MIN_BASE = 10.0
 
 MOMO_TAKER_LONG_MIN = 1.10
@@ -99,13 +105,38 @@ MOMO_TAKER_SHORT_MAX = 0.90
 MOMO_LIQ_WINDOW_SEC = 30
 MOMO_COOLDOWN_SEC = 120          # анти-спам на 1 символ
 
-# вверху scanner.py (рядом с остальными конфигами)
-MOMO_POINTS = 18              # сколько последних апдейтов цены анализируем
+MOMO_POINTS = 18
 MOMO_MIN_MOVE_PCT = 2.5       # для “пампа” подними 2.0–4.0
 MOMO_VOL_ACCEL_THRESH = 6.0
-MOMO_VOL_MIN_NOW = 500.0      # USDT за short окно (подстрой)
 MOMO_COOLDOWN_SEC = 120
 
+
+# ===== PRE_FORM (flat -> small move -> early entry before pump/dump) =====
+# Качество: только когда цена реально начинает двигаться, не шум.
+PRE_FORM_RANGE_MAX_PCT = 0.35    # был в узком флете
+PRE_FORM_LOOKBACK = 20
+PRE_FORM_MIN_MOVE_PCT = 0.45     # минимум движения (не 0.15% шум)
+PRE_FORM_MAX_MOVE_PCT = 1.0      # ещё не полный памп (ниже MOMO)
+PRE_FORM_RECENT_POINTS = 6       # последние N точек — движение "сейчас"
+PRE_FORM_RECENT_MIN_PCT = 0.20   # за последние точки минимум % в ту же сторону
+PRE_FORM_EDGE_RATIO = 0.70       # цена у края диапазона (LONG: last в верхних 30%, SHORT: в нижних 30%)
+PRE_FORM_VOL_ACCEL_MIN = 2.2     # объём чётко подходит (как SETUP)
+PRE_FORM_P24H_MAX_PUMPED = 6.0   # для SHORT: не брать если уже памп p24h > 6%
+PRE_FORM_P24H_MAX_DUMPED = -8.0  # для LONG: не брать если уже дамп p24h < -8%
+PRE_FORM_COOLDOWN_SEC = 180
+PRINT_PRE_FORM = True
+
+# --- Candle / MA / wick (quality filters) ---
+CANDLE_SEC = 60
+CANDLE_MIN_BODY_RATIO = 0.3
+CANDLE_MAX_UPPER_WICK_LONG = 0.5
+CANDLE_MAX_LOWER_WICK_SHORT = 0.5
+MA_SHORT = 7
+MA_LONG = 25
+USE_MA_FILTER = True
+FUNDING_EXTREME_FRAC = 0.0001
+HOLD_QUALITY_MIN_RATIO = 0.8
+NEAR_24H_LEVEL_PCT = 1.0
 
 # --- Optional extra confirm signals ---
 USE_TAKER_RATIO = True
@@ -156,6 +187,8 @@ def fmt_funding(fr: float) -> str:
 def cached_latest(ring, default=0.0):
     if ring is None:
         return default
+    if isinstance(ring, (int, float)):
+        return float(ring)
     try:
         vals = ring.values()
         if not vals:
@@ -267,6 +300,115 @@ def ring_window(ring, sec: float, now: Optional[float] = None) -> List[Tuple[flo
         return out
     except Exception:
         return []
+
+
+def build_candles(price_ring, volume_ring, candle_sec: float, now: float, max_candles: int = 20) -> List[Tuple[float, float, float, float, float]]:
+    """Returns list of (o, h, l, c, v) for last max_candles candles. v = sum volume in bucket."""
+    w = ring_window(price_ring, candle_sec * max_candles, now=now)
+    if len(w) < 2:
+        return []
+    vol_w = ring_window(volume_ring, candle_sec * max_candles, now=now)
+    vol_by_ts = {float(t): float(v) for t, v in vol_w} if vol_w else {}
+    buckets: Dict[int, List[Tuple[float, float]]] = {}
+    for ts, p in w:
+        t = float(ts)
+        p = float(p)
+        bucket = int(t // candle_sec) * int(candle_sec)
+        if bucket not in buckets:
+            buckets[bucket] = []
+        buckets[bucket].append((t, p))
+    candles = []
+    for bucket in sorted(buckets.keys(), reverse=True)[:max_candles]:
+        pts = buckets[bucket]
+        if not pts:
+            continue
+        o = pts[0][1]
+        c = pts[-1][1]
+        h = max(p for _, p in pts)
+        lo = min(p for _, p in pts)
+        v = sum(vol_by_ts.get(t, 0.0) for t, _ in pts)
+        candles.append((o, h, lo, c, v))
+    return candles
+
+
+def last_candle_body_wick(candles: List[Tuple[float, float, float, float, float]]) -> Tuple[float, float, float]:
+    """Returns (body_ratio, upper_wick_ratio, lower_wick_ratio). Range = h-l."""
+    if not candles:
+        return 0.0, 0.0, 0.0
+    o, h, l, c, _ = candles[0]
+    if h <= l:
+        return 0.0, 0.0, 0.0
+    rng = h - l
+    body = abs(c - o)
+    body_ratio = body / rng
+    top = max(o, c)
+    bot = min(o, c)
+    upper_wick = (h - top) / rng
+    lower_wick = (bot - l) / rng
+    return body_ratio, upper_wick, lower_wick
+
+
+def ma_sma(prices: List[float], n: int) -> Optional[float]:
+    if len(prices) < n:
+        return None
+    return sum(prices[-n:]) / n
+
+
+def ma_alignment_ok(prices: List[float], bias: str, short_n: int = 7, long_n: int = 25) -> bool:
+    if len(prices) < long_n:
+        return True
+    ma_s = ma_sma(prices, short_n)
+    ma_l = ma_sma(prices, long_n)
+    if ma_s is None or ma_l is None:
+        return True
+    last = prices[-1]
+    if bias == "LONG":
+        return last > ma_s and ma_s > ma_l
+    if bias == "SHORT":
+        return last < ma_s and ma_s < ma_l
+    return True
+
+
+def near_24h_level(price: float, h24h: float, l24h: float, bias: str, pct: float = 1.0) -> Tuple[bool, str]:
+    """Returns (near, 'HIGH'|'LOW'|'')."""
+    if h24h <= 0 or l24h <= 0:
+        return False, ""
+    if bias == "LONG" and h24h > 0 and price >= h24h * (1.0 - pct / 100.0):
+        return True, "HIGH"
+    if bias == "SHORT" and l24h > 0 and price <= l24h * (1.0 + pct / 100.0):
+        return True, "LOW"
+    return False, ""
+
+
+def pressure_score(taker_ratio: Optional[float], basis_pct: Optional[float], liq_imb: float, bias: str) -> float:
+    """Positive = aligned with bias. -1..1 scale."""
+    s = 0.0
+    if taker_ratio is not None:
+        s += (taker_ratio - 1.0) * 0.4 if bias == "LONG" else (1.0 - taker_ratio) * 0.4
+    if basis_pct is not None:
+        s += (basis_pct / 100.0) * 2.0 if bias == "LONG" else (-basis_pct / 100.0) * 2.0
+    s += liq_imb * 0.3
+    return clamp(s, -1.0, 1.0)
+
+
+def oi_price_align(oi_pct: float, move_pct: float, bias: str) -> bool:
+    """OI and price moving same direction as bias."""
+    if bias == "LONG":
+        return (oi_pct >= 0 and move_pct >= 0) or oi_pct >= 0.5
+    if bias == "SHORT":
+        return (oi_pct <= 0 and move_pct <= 0) or oi_pct <= -0.5
+    return True
+
+
+def funding_extreme(fund_now: float, bias: str) -> bool:
+    """True if funding is extreme in trend direction (overheated)."""
+    if abs(fund_now) < FUNDING_EXTREME_FRAC:
+        return False
+    if bias == "LONG" and fund_now > FUNDING_EXTREME_FRAC:
+        return True
+    if bias == "SHORT" and fund_now < -FUNDING_EXTREME_FRAC:
+        return True
+    return False
 
 
 def direction_bias(prices: List[float]) -> Tuple[str, float, float]:
@@ -606,21 +748,16 @@ class Scanner:
             setattr(st, "_liq_deque", d)
         return d
 
-    def _liq_add(self, sym: str, ts: float, side: str, notional_usdt: float):
+    def _liq_add(self, sym: str, ts: float, side: str, notional_usdt: float, price: float = 0.0):
         st = STATES.get(sym)
         if st is None:
             return
         d = self._liq_deque(st)
-        # BUY liquidation -> short liquidations -> pushes UP
-        # SELL liquidation -> long liquidations -> pushes DOWN
         sign = +1.0 if str(side).upper() == "BUY" else -1.0
-        d.append((float(ts), sign * float(notional_usdt)))
+        d.append((float(ts), sign * float(notional_usdt), float(price)))
 
     def _liq_window_stats(self, st, sec: float, now: Optional[float] = None) -> Tuple[float, float, float, float]:
-        """
-        Returns (buy_usdt, sell_usdt, total_usdt, imbalance)
-        imbalance = (buy - sell) / total
-        """
+        """Returns (buy_usdt, sell_usdt, total_usdt, imbalance). Supports (ts, signed) or (ts, signed, price)."""
         now = time.time() if now is None else float(now)
         d = self._liq_deque(st)
         buy = 0.0
@@ -630,7 +767,8 @@ class Scanner:
         while d and (now - d[0][0] > sec):
             d.popleft()
 
-        for ts, signed in d:
+        for row in d:
+            ts, signed = row[0], row[1]
             v = float(signed)
             if v >= 0:
                 buy += v
@@ -640,6 +778,30 @@ class Scanner:
 
         imb = 0.0 if total <= 0 else (buy - sell) / total
         return buy, sell, total, imb
+
+    def _liq_cluster_near(self, st, price: float, sec: float, bucket_pct: float, near_pct: float, now: Optional[float] = None) -> bool:
+        """True if price is within near_pct of a liquidation cluster level (bucket_pct)."""
+        now = time.time() if now is None else float(now)
+        d = self._liq_deque(st)
+        buckets: Dict[float, float] = {}
+        while d and (now - d[0][0] > sec):
+            d.popleft()
+        for row in d:
+            if len(row) < 3:
+                continue
+            ts, signed, p = row[0], row[1], row[2]
+            if p <= 0:
+                continue
+            bucket = round(p / (price * bucket_pct / 100.0)) * (price * bucket_pct / 100.0)
+            buckets[bucket] = buckets.get(bucket, 0.0) + abs(float(signed))
+        if not buckets:
+            return False
+        for lvl, vol in buckets.items():
+            if vol < LIQ_MIN_USDT * 0.5:
+                continue
+            if abs(price - lvl) / price * 100.0 <= near_pct:
+                return True
+        return False
 
     async def _liq_ws_loop(self):
         backoff = 1.0
@@ -672,11 +834,12 @@ class Scanner:
                             ap = o.get("ap") or o.get("p")
                             try:
                                 notional = float(q) * float(ap)
+                                liq_price = float(ap)
                             except Exception:
                                 continue
 
                             ts = float(data.get("E", time.time() * 1000.0)) / 1000.0
-                            self._liq_add(sym, ts, side, notional)
+                            self._liq_add(sym, ts, side, notional, price=liq_price)
 
             except Exception:
                 pass
@@ -703,6 +866,9 @@ class Scanner:
             last = j[-1]
             ratio = float(last.get("buySellRatio", 0.0))
             self._taker_cache[sym] = (now, ratio)
+            st = STATES.get(sym)
+            if st is not None:
+                st.taker_ratio = ratio
             return ratio
         except Exception:
             return 0.0
@@ -726,15 +892,16 @@ class Scanner:
                 return 0.0
             basis_pct = (mark - idx) / idx * 100.0
             self._basis_cache[sym] = (now, basis_pct)
+            st = STATES.get(sym)
+            if st is not None:
+                st.basis_pct = basis_pct
             return float(basis_pct)
         except Exception:
             return 0.0
 
     # ---------- Breakout HOLD state machine ----------
-    def _breakout_hold_ok(self, st, bias: str, brk_now: bool, level: float, last_price: float, now: float) -> Tuple[bool, float]:
-        """
-        Returns (hold_ok, hold_age_sec)
-        """
+    def _breakout_hold_ok(self, st, bias: str, brk_now: bool, level: float, last_price: float, now: float) -> Tuple[bool, float, float]:
+        """Returns (hold_ok, hold_age_sec, quality 0..1). quality = min(1, age/HOLD_SEC)."""
         dir_key = "UP" if bias == "LONG" else "DOWN"
         pend_dir = getattr(st, "_brk_pend_dir", None)
         pend_ts = float(getattr(st, "_brk_pend_ts", 0.0))
@@ -744,7 +911,7 @@ class Scanner:
             st._brk_pend_dir = dir_key
             st._brk_pend_ts = now
             st._brk_pend_level = float(level)
-            return False, 0.0
+            return False, 0.0, 0.0
 
         if pend_dir == dir_key and pend_ts > 0:
             age = now - pend_ts
@@ -752,17 +919,18 @@ class Scanner:
             if bias == "LONG":
                 if last_price < pend_level * (1.0 - HOLD_FAIL_RETRACE_PCT / 100.0):
                     st._brk_pend_ts = 0.0
-                    return False, 0.0
+                    return False, 0.0, 0.0
             else:
                 if last_price > pend_level * (1.0 + HOLD_FAIL_RETRACE_PCT / 100.0):
                     st._brk_pend_ts = 0.0
-                    return False, 0.0
+                    return False, 0.0, 0.0
 
+            quality = min(1.0, age / HOLD_SEC)
             if age >= HOLD_SEC:
-                return True, age
-            return False, age
+                return True, age, quality
+            return False, age, quality
 
-        return False, 0.0
+        return False, 0.0, 0.0
     
 
     # ---------- Telegram gating ----------
@@ -775,6 +943,9 @@ class Scanner:
             return True
         
         if tag.startswith("FADE"):
+            return True
+
+        if tag.startswith("PRE_FORM"):
             return True
 
         # Сигналы "высокого доверия" — шлём всегда (но анти-спам/rl всё равно сработает ниже по коду)
@@ -930,50 +1101,86 @@ class Scanner:
                         if send_to_tg:
                             signals.append((rank, msg))
 
+                        if momo_tag == "MOMO_UP":
+                            st.momo_peak_price = float(prices[-1]) if prices else 0.0
+                            st.momo_peak_ts = now
+                        self.book.upsert(sym, 95.0 + clamp(abs(momo_move), 0.0, 20.0))
                         continue
 
-                    # --- remember peak after MOMO_UP (for FADE) ---
-                    if momo_ok and momo_tag == "MOMO_UP":
-                        st.momo_peak_price = prices[-1]
-                        st.momo_peak_ts = now
-
-                    if momo_ok:
-                        last_ts = float(getattr(st, "momo_last_ts", 0.0))
-                        if now - last_ts >= MOMO_COOLDOWN_SEC:
-                            st.momo_last_ts = now
-
-
-                    # --- FADE after pump (short) ---
                     # --- FADE after pump (short) ---
                     peak = float(getattr(st, "momo_peak_price", 0.0))
                     peak_ts = float(getattr(st, "momo_peak_ts", 0.0))
-
                     if peak > 0.0 and (now - peak_ts) <= 300 and len(prices) >= 2:
                         last = float(prices[-1])
-
-                    # обновляем пик, если цена делает новый хай
                         if last > peak:
                             st.momo_peak_price = last
                             st.momo_peak_ts = now
                         else:
-                        # откат от пика в %
                             retr = (peak - last) / peak * 100.0
-
                             taker = float(cached_latest(getattr(st, "taker_ratio", None), default=1.0))
                             basis = float(cached_latest(getattr(st, "basis", None), default=0.0))
-
                             if retr >= 1.5 and taker <= 0.75 and basis < 0:
                                 msg = f"{sym} VERY_HOT FADE_SHORT | retr={retr:.2f}% | taker={taker:.2f} basis={basis:+.3f}%"
                                 print(msg)
                                 signals.append((120.0 + retr, msg))
-                                st.momo_peak_price = 0.0  # чтобы не спамило
+                                st.momo_peak_price = 0.0
 
-
-
-
-                    # добавляем в кандидаты, чтобы дальше OI/funding могли подтянуться
-                            self.book.upsert(sym, 95.0 + clamp(abs(momo_move), 0.0, 20.0))
-
+                    # --- PRE_FORM: flat -> реальное начало движения (качество, не всё подряд) ---
+                    if len(prices) >= PRE_FORM_LOOKBACK + PRE_FORM_RECENT_POINTS:
+                        window = prices[-PRE_FORM_LOOKBACK:]
+                        lo_w, hi_w = min(window), max(window)
+                        last_p = float(prices[-1])
+                        if lo_w > 0 and hi_w > lo_w:
+                            range_pct_pre = (hi_w - lo_w) / lo_w * 100.0
+                            move_pct_pre = _pct_move(prices[-PRE_FORM_LOOKBACK], prices[-1])
+                            # Движение "сейчас": за последние N точек в ту же сторону и не меньше порога
+                            move_recent = _pct_move(prices[-(PRE_FORM_RECENT_POINTS + 1)], prices[-1])
+                            same_dir = (move_pct_pre > 0 and move_recent > 0) or (move_pct_pre < 0 and move_recent < 0)
+                            recent_ok = same_dir and abs(move_recent) >= PRE_FORM_RECENT_MIN_PCT
+                            # Цена у края диапазона (начало выхода из флета)
+                            rng_w = hi_w - lo_w
+                            at_edge_long = last_p >= lo_w + PRE_FORM_EDGE_RATIO * rng_w
+                            at_edge_short = last_p <= lo_w + (1.0 - PRE_FORM_EDGE_RATIO) * rng_w
+                            edge_ok = (move_pct_pre > 0 and at_edge_long) or (move_pct_pre < 0 and at_edge_short)
+                            if (
+                                range_pct_pre <= PRE_FORM_RANGE_MAX_PCT
+                                and PRE_FORM_MIN_MOVE_PCT <= abs(move_pct_pre) <= PRE_FORM_MAX_MOVE_PCT
+                                and recent_ok
+                                and edge_ok
+                            ):
+                                bias_pre = "LONG" if move_pct_pre > 0 else "SHORT"
+                                if (MODE == "BOTH" or MODE == bias_pre) and (INCLUDE_NEUTRAL or bias_pre != "NEUTRAL"):
+                                    p24h_pre = float(getattr(st, "p24h", 0.0))
+                                    if bias_pre == "LONG" and (p24h_pre > MAX_P24H_UP_PCT or p24h_pre < PRE_FORM_P24H_MAX_DUMPED):
+                                        pass
+                                    elif bias_pre == "SHORT" and (p24h_pre < -MAX_P24H_DOWN_PCT or p24h_pre > PRE_FORM_P24H_MAX_PUMPED):
+                                        pass
+                                    else:
+                                        ok_vol_pre, accel_pre, v_now_pre, v_base_pre = volume_acceleration_time(
+                                            st.volume,
+                                            short_sec=VOL_SHORT_SEC,
+                                            long_sec=VOL_LONG_SEC,
+                                            accel_thresh=PRE_FORM_VOL_ACCEL_MIN,
+                                            min_now=VOL_MIN_NOW,
+                                            min_base=VOL_MIN_BASE,
+                                            accel_cap=VOL_ACCEL_CAP,
+                                        )
+                                        if ok_vol_pre:
+                                            last_pre = getattr(st, "pre_form_last_ts", 0.0)
+                                            if (now - last_pre) >= PRE_FORM_COOLDOWN_SEC:
+                                                st.pre_form_last_ts = now
+                                                tag_pre = "PRE_FORM_UP" if bias_pre == "LONG" else "PRE_FORM_DOWN"
+                                                msg_pre = (
+                                                    f"{sym} WATCH {tag_pre}({bias_pre}) | "
+                                                    f"range={range_pct_pre:.3f}% move={move_pct_pre:+.2f}% recent={move_recent:+.2f}% | "
+                                                    f"vol_accel={accel_pre:.2f}x | q24h={fmt_q24h(float(q24h))} | p24h={p24h_pre:.2f}%"
+                                                )
+                                                if PRINT_PRE_FORM:
+                                                    print(msg_pre)
+                                                self.book.upsert(sym, 70.0 + abs(move_pct_pre))
+                                                rank_pre = 85.0 + abs(move_pct_pre) + clamp(accel_pre, 0.0, 10.0)
+                                                signals.append((rank_pre, msg_pre))
+                                                continue
 
                     ok_price, rng = price_compression(prices)
                     if not ok_price:
@@ -1016,12 +1223,29 @@ class Scanner:
                         continue
 
                     p24h = float(getattr(st, "p24h", 0.0))
-                    if bias == "LONG" and p24h > 8.0:
+                    if bias == "LONG" and p24h > MAX_P24H_UP_PCT:
                         self.stats.p24h_hot += 1
                         continue
-                    if bias == "SHORT" and p24h < -15.0:
+                    if bias == "SHORT" and p24h < -MAX_P24H_DOWN_PCT:
                         self.stats.p24h_hot += 1
                         continue
+
+                    if USE_MA_FILTER and not ma_alignment_ok(prices, bias, short_n=MA_SHORT, long_n=MA_LONG):
+                        self.stats.bias_filtered += 1
+                        continue
+
+                    candles = build_candles(st.price, st.volume, CANDLE_SEC, now)
+                    if candles:
+                        body_r, upper_w, lower_w = last_candle_body_wick(candles)
+                        if body_r < CANDLE_MIN_BODY_RATIO:
+                            self.stats.no_compress += 1
+                            continue
+                        if bias == "LONG" and upper_w > CANDLE_MAX_UPPER_WICK_LONG:
+                            self.stats.bias_filtered += 1
+                            continue
+                        if bias == "SHORT" and lower_w > CANDLE_MAX_LOWER_WICK_SHORT:
+                            self.stats.bias_filtered += 1
+                            continue
 
                     setup_score = calc_setup_score(rng_pct=rng_pct, accel=accel, bias=bias, move_pct=move_pct, pos=pos)
                     if setup_score < BOOK_MIN_SCORE:
@@ -1080,13 +1304,26 @@ class Scanner:
                     momo_ok, momo_tag, momo_move, momo_accel, momo_v_now, momo_v_base, momo_taker, momo_basis, momo_liq_total = self._momo_impulse(sym, st, now)
 
                     if momo_ok:
-                        level = "VERY_HOT"
-                        tag_out = momo_tag
-                    # собери msg в том же формате что остальные (добавь momo_* поля)
-                    # и дальше пусть идёт в твой signals.append(...) + should_send_tg(...)
-
-                    
-
+                        p24h = float(getattr(st, "p24h", 0.0))
+                        momo_taker = cached_latest(getattr(st, "taker_ratio", None), default=None)
+                        momo_basis = cached_latest(getattr(st, "basis_pct", None)) or cached_latest(getattr(st, "basis", None), default=None)
+                        if momo_taker is None:
+                            momo_taker = await self._get_taker_ratio(http, sym)
+                        if momo_basis is None:
+                            momo_basis = await self._get_basis_pct(http, sym)
+                        momo_taker = float(momo_taker or 1.0)
+                        momo_basis = float(momo_basis or 0.0)
+                        msg = (
+                            f"{sym} VERY_HOT {momo_tag}({'LONG' if momo_move > 0 else 'SHORT'}) | "
+                            f"move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | vol_accel={momo_accel:.2f}x | "
+                            f"v_now={momo_v_now:.1f} v_base={momo_v_base:.1f} | liq={momo_liq_total/1000:.0f}K | "
+                            f"taker={momo_taker:.2f} basis={momo_basis:+.3f}% | p24h={p24h:.2f}%"
+                        )
+                        print(msg)
+                        if self._should_send_tg("VERY_HOT", tag=momo_tag, oi_pct=abs(momo_move), sp_vr=momo_accel, liq_total=momo_liq_total):
+                            rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
+                            signals.append((rank, msg))
+                        continue
 
                     ok_price, rng = price_compression(prices)
                     if not ok_price:
@@ -1119,11 +1356,24 @@ class Scanner:
                     if MODE == "SHORT" and bias != "SHORT":
                         continue
 
+                    if USE_MA_FILTER and not ma_alignment_ok(prices, bias, short_n=MA_SHORT, long_n=MA_LONG):
+                        continue
+
+                    candles_s2 = build_candles(st.price, st.volume, CANDLE_SEC, now)
+                    if candles_s2:
+                        body_r, upper_w, lower_w = last_candle_body_wick(candles_s2)
+                        if body_r < CANDLE_MIN_BODY_RATIO:
+                            continue
+                        if bias == "LONG" and upper_w > CANDLE_MAX_UPPER_WICK_LONG:
+                            continue
+                        if bias == "SHORT" and lower_w > CANDLE_MAX_LOWER_WICK_SHORT:
+                            continue
+
                     p24h = float(getattr(st, "p24h", 0.0))
-                    if bias == "LONG" and p24h > 8.0:
+                    if bias == "LONG" and p24h > MAX_P24H_UP_PCT:
                         self.stats.s2_p24h_hot += 1
                         continue
-                    if bias == "SHORT" and p24h < -15.0:
+                    if bias == "SHORT" and p24h < -MAX_P24H_DOWN_PCT:
                         self.stats.s2_p24h_hot += 1
                         continue
 
@@ -1143,13 +1393,16 @@ class Scanner:
                         level = "WATCH"
                         self.stats.oi_not_growing += 1
 
+                    if not oi_price_align(oi_pct, move_pct, bias) and level in ("HOT", "VERY_HOT"):
+                        level = "WATCH"
+
                     last_price = prices[-1]
                     if bias == "LONG":
                         brk_now, brk_level = breakout_level_up(prices, lookback=BREAKOUT_LOOKBACK, pad_pct=BREAKOUT_PAD_PCT)
                     else:
                         brk_now, brk_level = breakout_level_down(prices, lookback=BREAKOUT_LOOKBACK, pad_pct=BREAKOUT_PAD_PCT)
 
-                    brk_hold_ok, brk_age = self._breakout_hold_ok(st, bias, brk_now, brk_level, last_price, now)
+                    brk_hold_ok, brk_age, brk_quality = self._breakout_hold_ok(st, bias, brk_now, brk_level, last_price, now)
 
                     spike, sp_move, sp_vr, sp_vol = spike_detector(
                         price_ring=st.price,
@@ -1195,6 +1448,14 @@ class Scanner:
                     basis_ok = (basis_pct is not None) and (abs(basis_pct) >= BASIS_MIN_ABS_PCT) if USE_BASIS else True
                     basis_dir_ok = (basis_pct is not None) and ((basis_pct > 0) if bias == "LONG" else (basis_pct < 0)) if USE_BASIS else True
                     taker_dir_ok = (taker_ratio is not None) and ((taker_ratio >= 1.05) if bias == "LONG" else (taker_ratio <= 0.95)) if USE_TAKER_RATIO else True
+
+                    press = pressure_score(
+                        float(taker_ratio) if taker_ratio is not None else None,
+                        float(basis_pct) if basis_pct is not None else None,
+                        liq_imb, bias,
+                    )
+                    if press < -0.3:
+                        continue
 
                     squeeze = pre_squeeze and basis_ok and basis_dir_ok and taker_dir_ok
 
@@ -1257,6 +1518,16 @@ class Scanner:
                         if brk_hold_ok:
                             rank += 10.0
                         rank += clamp(abs(oi_pct), 0.0, 15.0)
+                        rank += brk_quality * 10.0
+                        if funding_extreme(fund_now, bias):
+                            rank -= 10.0
+                        h24h = float(getattr(st, "h24h", 0.0))
+                        l24h = float(getattr(st, "l24h", 0.0))
+                        near_24h, level_24h = near_24h_level(last_price, h24h, l24h, bias, pct=NEAR_24H_LEVEL_PCT)
+                        if near_24h and level_24h in ("HIGH", "LOW"):
+                            rank += 5.0
+                        if self._liq_cluster_near(st, last_price, LIQ_WINDOW_SEC, LIQ_CLUSTER_BUCKET_PCT, LIQ_NEAR_CLUSTER_PCT, now=now):
+                            rank += 5.0
                         signals.append((rank, msg))
 
                 if self.tg_enabled and signals:
