@@ -15,6 +15,8 @@ class TickerState:
         self.last_q = None
         self.p24h = 0.0
         self.q24h = 0.0  # 24h quote volume (USDT)
+        self.h24h = 0.0  # 24h high
+        self.l24h = 0.0  # 24h low
 
 
         # антиспам SETUP (ступени)
