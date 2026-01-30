@@ -43,6 +43,8 @@ async def start_ws(*, allowed: set[str] | None = None):
                         c = d.get("c")   # last price
                         q = d.get("q")   # quoteVolume 24h
                         P = d.get("P")   # priceChangePercent
+                        h = d.get("h")   # 24h high
+                        l = d.get("l")   # 24h low
                         if c is None or q is None:
                             continue
 
@@ -50,6 +52,8 @@ async def start_ws(*, allowed: set[str] | None = None):
                             price = float(c)
                             q24h = float(q)
                             p24h = float(P) if P is not None else 0.0
+                            h24h = float(h) if h is not None else 0.0
+                            l24h = float(l) if l is not None else 0.0
                         except Exception:
                             continue
 
@@ -57,6 +61,8 @@ async def start_ws(*, allowed: set[str] | None = None):
                         st.price.add(price, ts=now)
                         st.q24h = q24h
                         st.p24h = p24h
+                        st.h24h = h24h
+                        st.l24h = l24h
 
                         # volume ring: дельта quoteVolume (приблизительно “приток” USDT)
                         last_q = getattr(st, "last_q", None)
