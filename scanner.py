@@ -91,7 +91,7 @@ MAX_P24H_DOWN_PCT = 15.0
 MOMO_LOOKBACK_SEC = 120          # смотрим импульс за 2 минуты
 MOMO_CONFIRM_SEC = 20            # подтверждение что импульс “сейчас продолжается”
 MOMO_MIN_MOVE_PCT = 2.5
-MOMO_CONFIRM_MIN_PCT = 0.6       # минимум % за CONFIRM (в ту же сторону)
+MOMO_CONFIRM_MIN_PCT = 1.0       # минимум % за CONFIRM — движение "сейчас"
 
 MOMO_VOL_SHORT_SEC = 10
 MOMO_VOL_LONG_SEC = 180
@@ -103,7 +103,13 @@ MOMO_TAKER_LONG_MIN = 1.10
 MOMO_TAKER_SHORT_MAX = 0.90
 
 MOMO_LIQ_WINDOW_SEC = 30
-MOMO_COOLDOWN_SEC = 120          # анти-спам на 1 символ
+MOMO_COOLDOWN_SEC = 120
+
+# p24h полоса для MOMO: не входить когда уже разогнано или разгружено
+MOMO_P24H_MIN_UP = -12.0     # MOMO_UP: не брать если p24h < -12% (уже дамп)
+MOMO_P24H_MAX_UP = 25.0      # MOMO_UP: не брать если p24h > 25% (уже памп)
+MOMO_P24H_MIN_DOWN = -25.0   # MOMO_DOWN: не брать если p24h < -25%
+MOMO_P24H_MAX_DOWN = 35.0    # MOMO_DOWN: не брать если p24h > 35%
 
 MOMO_POINTS = 18
 MOMO_MIN_MOVE_PCT = 2.5       # для “пампа” подними 2.0–4.0
@@ -1040,6 +1046,13 @@ class Scanner:
 
                     if momo_ok:
                         p24h = float(getattr(st, "p24h", 0.0))
+                        # Не входить когда уже некуда падать / уже разогнано
+                        if momo_move > 0:  # MOMO_UP
+                            if p24h < MOMO_P24H_MIN_UP or p24h > MOMO_P24H_MAX_UP:
+                                continue
+                        else:  # MOMO_DOWN
+                            if p24h < MOMO_P24H_MIN_DOWN or p24h > MOMO_P24H_MAX_DOWN:
+                                continue
 
                         momo_taker = cached_latest(getattr(st, "taker_ratio", None), default=None)
                         momo_basis = cached_latest(getattr(st, "basis", None), default=None)
@@ -1095,8 +1108,8 @@ class Scanner:
                         print(msg)
 
                         rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
-                        # if conflicting/late -> don't spam TG unless it's VERY strong
-                        send_to_tg = (not warn) or (abs(momo_move) >= 4.5 and momo_accel >= 10.0)
+                        # В TG только когда OK (без CHECK) — не слать taker<1 / basis<0 / late
+                        send_to_tg = not warn
 
                         if send_to_tg:
                             signals.append((rank, msg))
@@ -1305,6 +1318,12 @@ class Scanner:
 
                     if momo_ok:
                         p24h = float(getattr(st, "p24h", 0.0))
+                        if momo_move > 0:
+                            if p24h < MOMO_P24H_MIN_UP or p24h > MOMO_P24H_MAX_UP:
+                                continue
+                        else:
+                            if p24h < MOMO_P24H_MIN_DOWN or p24h > MOMO_P24H_MAX_DOWN:
+                                continue
                         momo_taker = cached_latest(getattr(st, "taker_ratio", None), default=None)
                         momo_basis = cached_latest(getattr(st, "basis_pct", None)) or cached_latest(getattr(st, "basis", None), default=None)
                         if momo_taker is None:
