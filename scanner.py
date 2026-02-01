@@ -115,6 +115,8 @@ MOMO_POINTS = 18
 
 PUMPED_WATCH_P24H_MIN = 25.0
 PUMPED_WATCH_COOLDOWN_SEC = 7200
+DUMPED_WATCH_P24H_MAX = -50.0   # p24h ниже = "в дампе", раз в кулдаун слать WATCH (MM возит вверх-вниз)
+DUMPED_WATCH_COOLDOWN_SEC = 7200
 FLAT_RANGE_60S_MAX_PCT = 0.12
 USE_AGG_TRADES = True
 AGG_TRADES_LOOKBACK_SEC = 60
@@ -1093,6 +1095,8 @@ class Scanner:
 
         if tag.startswith("PUMPED_WATCH"):
             return True
+        if tag.startswith("DUMPED_WATCH"):
+            return True
 
         # Сигналы "высокого доверия" — шлём всегда (но анти-спам/rl всё равно сработает ниже по коду)
         if tag.startswith("SQUEEZE") or tag.startswith("LIQ"):
@@ -1208,9 +1212,30 @@ class Scanner:
                                         )
                                         print(msg_pw)
                                         signals.append((80.0 + min(p24h, 50.0), msg_pw))
+                                # В дампе (BULLA-тип): раз в кулдаун — "MM возит вверх-вниз"
+                                if p24h <= DUMPED_WATCH_P24H_MAX:
+                                    last_dw = float(getattr(st, "dumped_watch_ts", 0.0))
+                                    if (now - last_dw) >= DUMPED_WATCH_COOLDOWN_SEC:
+                                        st.dumped_watch_ts = now
+                                        msg_dw = (
+                                            f"{sym} WATCH DUMPED_WATCH | p24h={p24h:.1f}% move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | "
+                                            f"vol_accel={momo_accel:.2f}x — в дампе, MM возит, смотри (лонг от дна? шорт?)"
+                                        )
+                                        print(msg_dw)
+                                        signals.append((78.0, msg_dw))
                                 continue
                         else:  # MOMO_DOWN
                             if p24h < MOMO_P24H_MIN_DOWN or p24h > MOMO_P24H_MAX_DOWN:
+                                if p24h <= DUMPED_WATCH_P24H_MAX:
+                                    last_dw = float(getattr(st, "dumped_watch_ts", 0.0))
+                                    if (now - last_dw) >= DUMPED_WATCH_COOLDOWN_SEC:
+                                        st.dumped_watch_ts = now
+                                        msg_dw = (
+                                            f"{sym} WATCH DUMPED_WATCH | p24h={p24h:.1f}% move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | "
+                                            f"в дампе, MM возит, смотри (лонг от дна? шорт?)"
+                                        )
+                                        print(msg_dw)
+                                        signals.append((78.0, msg_dw))
                                 continue
 
                         momo_taker = cached_latest(getattr(st, "taker_ratio", None), default=None)
@@ -1508,9 +1533,29 @@ class Scanner:
                                         )
                                         print(msg_pw)
                                         signals.append((80.0 + min(p24h, 50.0), msg_pw))
+                                if p24h <= DUMPED_WATCH_P24H_MAX:
+                                    last_dw = float(getattr(st, "dumped_watch_ts", 0.0))
+                                    if (now - last_dw) >= DUMPED_WATCH_COOLDOWN_SEC:
+                                        st.dumped_watch_ts = now
+                                        msg_dw = (
+                                            f"{sym} WATCH DUMPED_WATCH | p24h={p24h:.1f}% move={momo_move:.2f}% | "
+                                            f"в дампе, MM возит, смотри (лонг от дна? шорт?)"
+                                        )
+                                        print(msg_dw)
+                                        signals.append((78.0, msg_dw))
                                 continue
                         else:
                             if p24h < MOMO_P24H_MIN_DOWN or p24h > MOMO_P24H_MAX_DOWN:
+                                if p24h <= DUMPED_WATCH_P24H_MAX:
+                                    last_dw = float(getattr(st, "dumped_watch_ts", 0.0))
+                                    if (now - last_dw) >= DUMPED_WATCH_COOLDOWN_SEC:
+                                        st.dumped_watch_ts = now
+                                        msg_dw = (
+                                            f"{sym} WATCH DUMPED_WATCH | p24h={p24h:.1f}% move={momo_move:.2f}% | "
+                                            f"в дампе, MM возит, смотри (лонг от дна? шорт?)"
+                                        )
+                                        print(msg_dw)
+                                        signals.append((78.0, msg_dw))
                                 continue
                         momo_taker = cached_latest(getattr(st, "taker_ratio", None), default=None)
                         momo_basis = cached_latest(getattr(st, "basis_pct", None)) or cached_latest(getattr(st, "basis", None), default=None)
@@ -1767,8 +1812,11 @@ class Scanner:
                         last_a = getattr(st, "last_alert_ask_10k", 0.0) or 0.0
                         if last_b <= 0 and last_a <= 0:
                             continue
-                        pct_b = (abs(bid_10k - last_b) / last_b * 100.0) if last_b > 0 else 100.0
-                        pct_a = (abs(ask_10k - last_a) / last_a * 100.0) if last_a > 0 else 100.0
+                        # Не слать, если ничего не изменилось (0→0 не считаем изменением)
+                        if bid_10k == last_b and ask_10k == last_a:
+                            continue
+                        pct_b = (abs(bid_10k - last_b) / last_b * 100.0) if last_b > 0 else (100.0 if bid_10k > 0 else 0.0)
+                        pct_a = (abs(ask_10k - last_a) / last_a * 100.0) if last_a > 0 else (100.0 if ask_10k > 0 else 0.0)
                         if pct_b >= BOOK_UPDATE_MIN_CHANGE_PCT or pct_a >= BOOK_UPDATE_MIN_CHANGE_PCT:
                             msg = (
                                 f"{sym} BOOK_UPDATE | было bid_10k={fmt_q24h(last_b)} ask_10k={fmt_q24h(last_a)} | "
