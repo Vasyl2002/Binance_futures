@@ -155,6 +155,15 @@ FUNDING_EXTREME_FRAC = 0.0001
 HOLD_QUALITY_MIN_RATIO = 0.8
 NEAR_24H_LEVEL_PCT = 1.0
 
+# --- Order book (bid/ask) в алерты и повтор при сильном изменении ---
+USE_DEPTH = True
+DEPTH_LIMIT = 50
+DEPTH_MIN_LEVEL_USDT = 10_000.0   # только уровни от 10k USDT
+DEPTH_TTL_SEC = 15.0
+BOOK_UPDATE_COOLDOWN_SEC = 300    # повтор "стакан обновился" не чаще раз в 5 мин
+BOOK_UPDATE_MIN_CHANGE_PCT = 50.0  # слать повтор если bid_10k или ask_10k изменились на 50%+
+USE_BOOK_UPDATE = True            # слать BOOK_UPDATE когда стакан сильно изменился после алерта
+
 # --- Optional extra confirm signals ---
 USE_TAKER_RATIO = True
 TAKER_PERIOD = "5m"
@@ -684,7 +693,8 @@ class Scanner:
         # Caches (REST)
         self._taker_cache: Dict[str, Tuple[float, float]] = {}
         self._basis_cache: Dict[str, Tuple[float, float]] = {}
-        self._agg_trades_cache: Dict[str, Tuple[float, float, float]] = {}  # sym -> (ts, buy_usdt, sell_usdt)
+        self._agg_trades_cache: Dict[str, Tuple[float, float, float]] = {}
+        self._depth_cache: Dict[str, Tuple[float, float, float, float, float]] = {}  # sym -> (ts, bid_10k, ask_10k, imb, ...)
 
     def _print_stats_if_due(self):
         now = time.time()
@@ -986,6 +996,52 @@ class Scanner:
         except Exception:
             return None, None
 
+    async def _get_depth_stats(
+        self, session: aiohttp.ClientSession, sym: str
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+        """Returns (bid_10k, ask_10k, imb, total_10k). Только уровни от DEPTH_MIN_LEVEL_USDT. imb = (bid-ask)/(bid+ask)."""
+        if not USE_DEPTH:
+            return None, None, None, None
+        now = time.time()
+        cached = self._depth_cache.get(sym)
+        if cached and len(cached) >= 5 and (now - cached[0] <= DEPTH_TTL_SEC):
+            return cached[1], cached[2], cached[3], cached[4]
+        url = "https://fapi.binance.com/fapi/v1/depth"
+        params = {"symbol": sym, "limit": DEPTH_LIMIT}
+        try:
+            async with session.get(url, params=params, timeout=6) as r:
+                j = await r.json()
+            bids = j.get("bids") or []
+            asks = j.get("asks") or []
+            bid_10k = 0.0
+            ask_10k = 0.0
+            for row in bids:
+                if len(row) < 2:
+                    continue
+                p, q = float(row[0]), float(row[1])
+                notional = p * q
+                if notional >= DEPTH_MIN_LEVEL_USDT:
+                    bid_10k += notional
+            for row in asks:
+                if len(row) < 2:
+                    continue
+                p, q = float(row[0]), float(row[1])
+                notional = p * q
+                if notional >= DEPTH_MIN_LEVEL_USDT:
+                    ask_10k += notional
+            total = bid_10k + ask_10k
+            imb = (bid_10k - ask_10k) / total if total > 0 else 0.0
+            self._depth_cache[sym] = (now, bid_10k, ask_10k, imb, total)
+            return bid_10k, ask_10k, imb, total
+        except Exception:
+            return None, None, None, None
+
+    def _fmt_depth(self, bid_10k: Optional[float], ask_10k: Optional[float], imb: Optional[float]) -> str:
+        if bid_10k is None or ask_10k is None:
+            return ""
+        imb_str = f" imb={imb:+.2f}" if imb is not None else ""
+        return f"bid_10k={fmt_q24h(bid_10k)} ask_10k={fmt_q24h(ask_10k)}{imb_str}"
+
     # ---------- Breakout HOLD state machine ----------
     def _breakout_hold_ok(self, st, bias: str, brk_now: bool, level: float, last_price: float, now: float) -> Tuple[bool, float, float]:
         """Returns (hold_ok, hold_age_sec, quality 0..1). quality = min(1, age/HOLD_SEC)."""
@@ -1201,14 +1257,20 @@ class Scanner:
 
 
 
+                        bid_10k, ask_10k, depth_imb, _ = await self._get_depth_stats(http, sym)
+                        depth_str = f" | {self._fmt_depth(bid_10k, ask_10k, depth_imb)}" if USE_DEPTH and (bid_10k is not None or ask_10k is not None) else ""
                         msg = (
                             f"{sym} VERY_HOT {momo_tag}({ 'LONG' if momo_move>0 else 'SHORT' }) | "
                             f"move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | vol_accel={momo_accel:.2f}x | "
                             f"v_now={momo_v_now:.1f} v_base={momo_v_base:.1f} | "
                             f"liq={momo_liq_total/1000:.0f}K | taker={momo_taker:.2f} basis={momo_basis:+.3f}% | p24h={p24h:.2f}%"
-                            f" | {hint}"
+                            f"{depth_str} | {hint}"
                         )
                         print(msg)
+                        if USE_DEPTH and bid_10k is not None and ask_10k is not None:
+                            st.last_alert_bid_10k = bid_10k
+                            st.last_alert_ask_10k = ask_10k
+                            st.last_alert_book_ts = now
 
                         rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
                         # В TG только когда OK (без CHECK) + 5m тренд + поток в нашу сторону
@@ -1687,6 +1749,37 @@ class Scanner:
                         if self._liq_cluster_near(st, last_price, LIQ_WINDOW_SEC, LIQ_CLUSTER_BUCKET_PCT, LIQ_NEAR_CLUSTER_PCT, now=now):
                             rank += 5.0
                         signals.append((rank, msg))
+
+                # ---------- BOOK_UPDATE: повтор по стакану для символов, по которым уже слали алерт с глубиной ----------
+                if USE_DEPTH and USE_BOOK_UPDATE:
+                    for sym, st in list(STATES.items()):
+                        if not sym.endswith("USDT"):
+                            continue
+                        last_alert_ts = getattr(st, "last_alert_book_ts", 0.0) or 0.0
+                        if last_alert_ts <= 0:
+                            continue
+                        if (now - getattr(st, "last_book_update_alert_ts", 0.0)) < BOOK_UPDATE_COOLDOWN_SEC:
+                            continue
+                        bid_10k, ask_10k, depth_imb, _ = await self._get_depth_stats(http, sym)
+                        if bid_10k is None or ask_10k is None:
+                            continue
+                        last_b = getattr(st, "last_alert_bid_10k", 0.0) or 0.0
+                        last_a = getattr(st, "last_alert_ask_10k", 0.0) or 0.0
+                        if last_b <= 0 and last_a <= 0:
+                            continue
+                        pct_b = (abs(bid_10k - last_b) / last_b * 100.0) if last_b > 0 else 100.0
+                        pct_a = (abs(ask_10k - last_a) / last_a * 100.0) if last_a > 0 else 100.0
+                        if pct_b >= BOOK_UPDATE_MIN_CHANGE_PCT or pct_a >= BOOK_UPDATE_MIN_CHANGE_PCT:
+                            msg = (
+                                f"{sym} BOOK_UPDATE | было bid_10k={fmt_q24h(last_b)} ask_10k={fmt_q24h(last_a)} | "
+                                f"сейчас bid_10k={fmt_q24h(bid_10k)} ask_10k={fmt_q24h(ask_10k)} | imb={depth_imb:+.2f}"
+                            )
+                            print(msg)
+                            signals.append((75.0, msg))
+                            st.last_alert_bid_10k = bid_10k
+                            st.last_alert_ask_10k = ask_10k
+                            st.last_alert_book_ts = now
+                            st.last_book_update_alert_ts = now
 
                 if self.tg_enabled and signals:
                     signals.sort(key=lambda x: x[0], reverse=True)
