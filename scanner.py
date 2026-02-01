@@ -112,6 +112,17 @@ MOMO_P24H_MIN_DOWN = -25.0   # MOMO_DOWN: не брать если p24h < -25%
 MOMO_P24H_MAX_DOWN = 35.0    # MOMO_DOWN: не брать если p24h > 35%
 
 MOMO_POINTS = 18
+
+PUMPED_WATCH_P24H_MIN = 25.0
+PUMPED_WATCH_COOLDOWN_SEC = 7200
+FLAT_RANGE_60S_MAX_PCT = 0.12
+USE_AGG_TRADES = True
+AGG_TRADES_LOOKBACK_SEC = 60
+AGG_TRADES_MIN_RATIO = 0.52
+AGG_TRADES_TTL_SEC = 30.0
+USE_5M_TREND_FILTER = True
+CANDLE_5M_SEC = 300
+TREND_5M_BARS = 3
 MOMO_MIN_MOVE_PCT = 2.5       # для “пампа” подними 2.0–4.0
 MOMO_VOL_ACCEL_THRESH = 6.0
 MOMO_COOLDOWN_SEC = 120
@@ -417,6 +428,36 @@ def funding_extreme(fund_now: float, bias: str) -> bool:
     return False
 
 
+def trend_5m_downtrend(price_ring, now: float) -> bool:
+    """True if last TREND_5M_BARS of 5m candles are lower highs and lower lows."""
+    candles = build_candles(price_ring, None, CANDLE_5M_SEC, now, max_candles=TREND_5M_BARS + 1)
+    if candles is None:
+        candles = []
+    if len(candles) < 2:
+        return False
+    for i in range(min(TREND_5M_BARS, len(candles) - 1)):
+        o1, h1, lo1, c1, _ = candles[i]
+        o2, h2, lo2, c2, _ = candles[i + 1]
+        if h1 >= h2 or lo1 >= lo2:
+            return False
+    return True
+
+
+def trend_5m_uptrend(price_ring, now: float) -> bool:
+    """True if last TREND_5M_BARS of 5m candles are higher highs and higher lows."""
+    candles = build_candles(price_ring, None, CANDLE_5M_SEC, now, max_candles=TREND_5M_BARS + 1)
+    if candles is None:
+        candles = []
+    if len(candles) < 2:
+        return False
+    for i in range(min(TREND_5M_BARS, len(candles) - 1)):
+        o1, h1, lo1, c1, _ = candles[i]
+        o2, h2, lo2, c2, _ = candles[i + 1]
+        if h1 <= h2 or lo1 <= lo2:
+            return False
+    return True
+
+
 def direction_bias(prices: List[float]) -> Tuple[str, float, float]:
     """
     bias:
@@ -641,8 +682,9 @@ class Scanner:
         self._liq_task: Optional[asyncio.Task] = None
 
         # Caches (REST)
-        self._taker_cache: Dict[str, Tuple[float, float]] = {}   # sym -> (ts, ratio)
-        self._basis_cache: Dict[str, Tuple[float, float]] = {}   # sym -> (ts, basis_pct)
+        self._taker_cache: Dict[str, Tuple[float, float]] = {}
+        self._basis_cache: Dict[str, Tuple[float, float]] = {}
+        self._agg_trades_cache: Dict[str, Tuple[float, float, float]] = {}  # sym -> (ts, buy_usdt, sell_usdt)
 
     def _print_stats_if_due(self):
         now = time.time()
@@ -905,6 +947,45 @@ class Scanner:
         except Exception:
             return 0.0
 
+    async def _get_agg_trades_flow(
+        self, session: aiohttp.ClientSession, sym: str, last_sec: float = 60.0
+    ) -> Tuple[Optional[float], Optional[float]]:
+        """Returns (buy_usdt, sell_usdt) for last_sec. m=False -> buyer taker -> buy."""
+        if not USE_AGG_TRADES:
+            return None, None
+        now = time.time()
+        cached = self._agg_trades_cache.get(sym)
+        if cached and (now - cached[0] <= AGG_TRADES_TTL_SEC):
+            return cached[1], cached[2]
+        start_ms = int((now - last_sec) * 1000)
+        url = "https://fapi.binance.com/fapi/v1/aggTrades"
+        params = {"symbol": sym, "startTime": start_ms, "limit": 1000}
+        try:
+            async with session.get(url, params=params, timeout=8) as r:
+                j = await r.json()
+            if not isinstance(j, list):
+                return None, None
+            buy_usdt = 0.0
+            sell_usdt = 0.0
+            cutoff = now - last_sec
+            for t in j:
+                ts_ms = int(t.get("T", 0))
+                ts = ts_ms / 1000.0
+                if ts < cutoff:
+                    continue
+                p = float(t.get("p", 0))
+                q = float(t.get("q", 0))
+                m = bool(t.get("m", False))
+                usdt = p * q
+                if m:
+                    sell_usdt += usdt
+                else:
+                    buy_usdt += usdt
+            self._agg_trades_cache[sym] = (now, buy_usdt, sell_usdt)
+            return buy_usdt, sell_usdt
+        except Exception:
+            return None, None
+
     # ---------- Breakout HOLD state machine ----------
     def _breakout_hold_ok(self, st, bias: str, brk_now: bool, level: float, last_price: float, now: float) -> Tuple[bool, float, float]:
         """Returns (hold_ok, hold_age_sec, quality 0..1). quality = min(1, age/HOLD_SEC)."""
@@ -952,6 +1033,9 @@ class Scanner:
             return True
 
         if tag.startswith("PRE_FORM"):
+            return True
+
+        if tag.startswith("PUMPED_WATCH"):
             return True
 
         # Сигналы "высокого доверия" — шлём всегда (но анти-спам/rl всё равно сработает ниже по коду)
@@ -1031,6 +1115,14 @@ class Scanner:
                         self.stats.few_prices += 1
                         continue
 
+                    # Цена не плоская: не слать MOMO если за 60с почти не двигалась
+                    pts_60 = ring_window_prices(st.price, 60.0, now)
+                    if len(pts_60) >= 5:
+                        vals_60 = [v for _, v in pts_60]
+                        lo_60, hi_60 = min(vals_60), max(vals_60)
+                        if lo_60 > 0 and (hi_60 - lo_60) / lo_60 * 100.0 < FLAT_RANGE_60S_MAX_PCT:
+                            continue
+
                     # --- MOMO / IMPULSE (ловим сильные пампы/дампы без compression) ---
                     momo_ok, momo_tag, momo_move, momo_accel, momo_v_now, momo_v_base, momo_taker, momo_basis, momo_liq_total = self._momo_impulse(sym, st, now)
                     best = float(getattr(st, "momo_best_abs", 0.0))
@@ -1049,6 +1141,17 @@ class Scanner:
                         # Не входить когда уже некуда падать / уже разогнано
                         if momo_move > 0:  # MOMO_UP
                             if p24h < MOMO_P24H_MIN_UP or p24h > MOMO_P24H_MAX_UP:
+                                # BULLA-тип: хотя бы один алерт "токен в движении"
+                                if p24h >= PUMPED_WATCH_P24H_MIN:
+                                    last_pw = float(getattr(st, "pumped_watch_ts", 0.0))
+                                    if (now - last_pw) >= PUMPED_WATCH_COOLDOWN_SEC:
+                                        st.pumped_watch_ts = now
+                                        msg_pw = (
+                                            f"{sym} WATCH PUMPED_WATCH | p24h={p24h:.1f}% move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | "
+                                            f"vol_accel={momo_accel:.2f}x — токен разогрет, смотри (шорт?)"
+                                        )
+                                        print(msg_pw)
+                                        signals.append((80.0 + min(p24h, 50.0), msg_pw))
                                 continue
                         else:  # MOMO_DOWN
                             if p24h < MOMO_P24H_MIN_DOWN or p24h > MOMO_P24H_MAX_DOWN:
@@ -1108,8 +1211,21 @@ class Scanner:
                         print(msg)
 
                         rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
-                        # В TG только когда OK (без CHECK) — не слать taker<1 / basis<0 / late
+                        # В TG только когда OK (без CHECK) + 5m тренд + поток в нашу сторону
                         send_to_tg = not warn
+                        if send_to_tg and USE_5M_TREND_FILTER:
+                            if momo_move > 0 and trend_5m_downtrend(st.price, now):
+                                send_to_tg = False
+                            if momo_move < 0 and trend_5m_uptrend(st.price, now):
+                                send_to_tg = False
+                        if send_to_tg and USE_AGG_TRADES:
+                            buy_usdt, sell_usdt = await self._get_agg_trades_flow(http, sym, last_sec=AGG_TRADES_LOOKBACK_SEC)
+                            if buy_usdt is not None and sell_usdt is not None:
+                                total = buy_usdt + sell_usdt
+                                if total > 1000.0:  # минимум объёма
+                                    ratio = buy_usdt / total if momo_move > 0 else sell_usdt / total
+                                    if ratio < AGG_TRADES_MIN_RATIO:
+                                        send_to_tg = False
 
                         if send_to_tg:
                             signals.append((rank, msg))
@@ -1320,6 +1436,16 @@ class Scanner:
                         p24h = float(getattr(st, "p24h", 0.0))
                         if momo_move > 0:
                             if p24h < MOMO_P24H_MIN_UP or p24h > MOMO_P24H_MAX_UP:
+                                if p24h >= PUMPED_WATCH_P24H_MIN:
+                                    last_pw = float(getattr(st, "pumped_watch_ts", 0.0))
+                                    if (now - last_pw) >= PUMPED_WATCH_COOLDOWN_SEC:
+                                        st.pumped_watch_ts = now
+                                        msg_pw = (
+                                            f"{sym} WATCH PUMPED_WATCH | p24h={p24h:.1f}% move={momo_move:.2f}% | "
+                                            f"vol_accel={momo_accel:.2f}x — токен разогрет, смотри (шорт?)"
+                                        )
+                                        print(msg_pw)
+                                        signals.append((80.0 + min(p24h, 50.0), msg_pw))
                                 continue
                         else:
                             if p24h < MOMO_P24H_MIN_DOWN or p24h > MOMO_P24H_MAX_DOWN:
@@ -1339,7 +1465,20 @@ class Scanner:
                             f"taker={momo_taker:.2f} basis={momo_basis:+.3f}% | p24h={p24h:.2f}%"
                         )
                         print(msg)
-                        if self._should_send_tg("VERY_HOT", tag=momo_tag, oi_pct=abs(momo_move), sp_vr=momo_accel, liq_total=momo_liq_total):
+                        send_s2 = self._should_send_tg("VERY_HOT", tag=momo_tag, oi_pct=abs(momo_move), sp_vr=momo_accel, liq_total=momo_liq_total)
+                        if send_s2 and USE_5M_TREND_FILTER:
+                            if momo_move > 0 and trend_5m_downtrend(st.price, now):
+                                send_s2 = False
+                            if momo_move < 0 and trend_5m_uptrend(st.price, now):
+                                send_s2 = False
+                        if send_s2 and USE_AGG_TRADES:
+                            buy_usdt, sell_usdt = await self._get_agg_trades_flow(http, sym, last_sec=AGG_TRADES_LOOKBACK_SEC)
+                            if buy_usdt is not None and sell_usdt is not None and (buy_usdt + sell_usdt) > 1000.0:
+                                total = buy_usdt + sell_usdt
+                                ratio = buy_usdt / total if momo_move > 0 else sell_usdt / total
+                                if ratio < AGG_TRADES_MIN_RATIO:
+                                    send_s2 = False
+                        if send_s2:
                             rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
                             signals.append((rank, msg))
                         continue
