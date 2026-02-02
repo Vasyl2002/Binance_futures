@@ -162,9 +162,10 @@ USE_DEPTH = True
 DEPTH_LIMIT = 50
 DEPTH_MIN_LEVEL_USDT = 10_000.0   # только уровни от 10k USDT
 DEPTH_TTL_SEC = 15.0
-BOOK_UPDATE_COOLDOWN_SEC = 300    # повтор "стакан обновился" не чаще раз в 5 мин
-BOOK_UPDATE_MIN_CHANGE_PCT = 50.0  # слать повтор если bid_10k или ask_10k изменились на 50%+
-USE_BOOK_UPDATE = True            # слать BOOK_UPDATE когда стакан сильно изменился после алерта
+BOOK_UPDATE_COOLDOWN_SEC = 300      # повтор "стакан обновился" не чаще раз в 5 мин
+BOOK_UPDATE_MIN_CHANGE_PCT = 50.0   # слать повтор если bid_10k или ask_10k изменились на 50%+
+BOOK_UPDATE_MAX_AGE_SEC = 900       # слать BOOK_UPDATE только пока базовый алерт свежий (например, 15 минут)
+USE_BOOK_UPDATE = True              # слать BOOK_UPDATE когда стакан сильно изменился после TG-алерта
 
 # --- Optional extra confirm signals ---
 USE_TAKER_RATIO = True
@@ -1292,11 +1293,6 @@ class Scanner:
                             f"{depth_str} | {hint}"
                         )
                         print(msg)
-                        if USE_DEPTH and bid_10k is not None and ask_10k is not None:
-                            st.last_alert_bid_10k = bid_10k
-                            st.last_alert_ask_10k = ask_10k
-                            st.last_alert_book_ts = now
-
                         rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
                         # В TG только когда OK (без CHECK) + 5m тренд + поток в нашу сторону
                         send_to_tg = not warn
@@ -1316,6 +1312,11 @@ class Scanner:
 
                         if send_to_tg:
                             signals.append((rank, msg))
+                            # BOOK_UPDATE-трекинг только если реально был TG-алерт
+                            if USE_DEPTH and bid_10k is not None and ask_10k is not None:
+                                st.last_alert_bid_10k = bid_10k
+                                st.last_alert_ask_10k = ask_10k
+                                st.last_alert_book_ts = now
 
                         if momo_tag == "MOMO_UP":
                             st.momo_peak_price = float(prices[-1]) if prices else 0.0
@@ -1795,13 +1796,16 @@ class Scanner:
                             rank += 5.0
                         signals.append((rank, msg))
 
-                # ---------- BOOK_UPDATE: повтор по стакану для символов, по которым уже слали алерт с глубиной ----------
+                # ---------- BOOK_UPDATE: повтор по стакану для символов, по которым уже слали TG-алерт с глубиной ----------
                 if USE_DEPTH and USE_BOOK_UPDATE:
                     for sym, st in list(STATES.items()):
                         if not sym.endswith("USDT"):
                             continue
                         last_alert_ts = getattr(st, "last_alert_book_ts", 0.0) or 0.0
                         if last_alert_ts <= 0:
+                            continue
+                        # Слежение за стаканом только пока базовый алерт свежий
+                        if (now - last_alert_ts) > BOOK_UPDATE_MAX_AGE_SEC:
                             continue
                         if (now - getattr(st, "last_book_update_alert_ts", 0.0)) < BOOK_UPDATE_COOLDOWN_SEC:
                             continue
