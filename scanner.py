@@ -114,6 +114,10 @@ MOMO_P24H_MIN_DOWN = -25.0   # MOMO_DOWN: не брать если p24h < -25%
 MOMO_P24H_MAX_DOWN = 35.0    # MOMO_DOWN: не брать если p24h > 35%
 
 MOMO_POINTS = 18
+# При сильном дампе/пампе за 120s ослабляем confirm и bounce, чтобы не пропускать резкие движения (типа INTC)
+MOMO_STRONG_MOVE_PCT = 4.0       # |move| >= это = "сильный" импульс
+MOMO_STRONG_CONFIRM_MIN_PCT = 0.0   # для сильного: в последние 20s достаточно "не развернулись" (c_move <= 0 для DOWN)
+MOMO_STRONG_BOUNCE_MAX_PCT = 0.6   # для сильного дампа: разрешить отскок от дна до 0.6% (иначе 0.35%)
 
 PUMPED_WATCH_P24H_MIN = 25.0
 PUMPED_WATCH_COOLDOWN_SEC = 7200
@@ -801,7 +805,8 @@ class Scanner:
             return (False, "", move_pct, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
         
-                # confirm: импульс должен продолжаться "прямо сейчас"
+                # confirm: импульс должен продолжаться "прямо сейчас" (для сильного дампа — достаточно "не развернулись")
+        strong_down = move_pct < 0 and abs(move_pct) >= MOMO_STRONG_MOVE_PCT
         cpts = ring_window_prices(st.price, MOMO_CONFIRM_SEC, now)
         if len(cpts) >= 4:
             c0 = cpts[0][1]
@@ -810,23 +815,27 @@ class Scanner:
                 c_move = (c1 / c0 - 1.0) * 100.0
                 if move_pct > 0 and c_move < MOMO_CONFIRM_MIN_PCT:
                     return (False, "", move_pct, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
-                if move_pct < 0 and c_move > -MOMO_CONFIRM_MIN_PCT:
-                    return (False, "", move_pct, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+                if move_pct < 0:
+                    if strong_down:
+                        if c_move > 0:
+                            return (False, "", move_pct, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+                    elif c_move > -MOMO_CONFIRM_MIN_PCT:
+                        return (False, "", move_pct, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
-        
-        # anti-chase: если уже откатили от локального пика/дна — не шлём
-        vals = [v for _, v in pts]  # <-- цены из твоего time-window
+        # anti-chase: если уже откатили от локального пика/дна — не шлём (для сильного дампа — разрешаем больший отскок)
+        vals = [v for _, v in pts]
         window = vals[-MOMO_POINTS:] if len(vals) >= MOMO_POINTS else vals
         hi = max(window)
         lo = min(window)
+        bounce_thresh = MOMO_STRONG_BOUNCE_MAX_PCT if strong_down else 0.35
 
         if move_pct > 0:
             dd = (hi - p1) / hi * 100.0 if hi > 0 else 0.0
-            if dd >= 0.35:   # откат от локального хая
+            if dd >= 0.35:
                 return (False, "", move_pct, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
         else:
             bounce = (p1 - lo) / lo * 100.0 if lo > 0 else 0.0
-            if bounce >= 0.35:  # отскок от локального дна
+            if bounce >= bounce_thresh:
                 return (False, "", move_pct, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0)
 
 
