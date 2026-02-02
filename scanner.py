@@ -82,6 +82,8 @@ LIQ_MIN_USDT = 150_000.0      # total liq notional in window (tune)
 LIQ_IMB_MIN = 0.60
 LIQ_CLUSTER_BUCKET_PCT = 0.5
 LIQ_NEAR_CLUSTER_PCT = 0.6
+LIQ_PRINT = True              # печатать каждую ликвидацию: [LIQ] SYM SIDE notional@price
+LIQ_PRINT_MIN_USDT = 5_000.0  # не печатать мелочь
 
 # --- p24h filters (after bias) ---
 MAX_P24H_UP_PCT = 8.0
@@ -179,6 +181,9 @@ BASIS_MIN_ABS_PCT = 0.02      # abs(mark-index)/index % threshold to consider fu
 # --- Alerts & Telegram batching ---
 LEVEL_RANK = {"IGNORE": 0, "WATCH": 1, "HOT": 2, "VERY_HOT": 3}
 ALERT_COOLDOWN = {"WATCH": 240, "HOT": 120, "VERY_HOT": 60}
+TG_STRUCTURED = True            # многострочные, структурированные сообщения в TG
+BOOK_WALLS_IN_TG = True        # в TG добавлять строку со стенками стакана (heatmap)
+CVD_SEC_IN_ALERT = 60          # окно CVD в алерте (сек)
 
 PRINT_WATCH = False
 PRINT_BREAKOUT_WATCH = True   # prints WATCH only if breakout_hold passed
@@ -212,6 +217,57 @@ def fmt_q24h(x: float) -> str:
 def fmt_funding(fr: float) -> str:
     # funding is fraction (e.g. 0.0001 == 0.01%)
     return f"{fr*100:.4f}%"
+
+
+def fmt_tg_alert(sym: str, signal_type: str, direction: str, **kwargs) -> str:
+    """Собирает многострочное структурированное сообщение для TG. Все поля опциональны."""
+    lines = []
+    lines.append(f"{sym} · {signal_type} ({direction})")
+    move = kwargs.get("move")
+    window_sec = kwargs.get("window_sec")
+    vol_accel = kwargs.get("vol_accel")
+    if move is not None:
+        move_str = f"Move: {move:+.2f}%"
+        if window_sec is not None:
+            move_str += f" ({int(window_sec)}s)"
+        if vol_accel is not None:
+            move_str += f" · Vol accel: {vol_accel:.2f}x"
+        lines.append(move_str)
+    liq_total = kwargs.get("liq_total")
+    liq_long = kwargs.get("liq_long")
+    liq_short = kwargs.get("liq_short")
+    if liq_total is not None and liq_total >= 0:
+        liq_str = f"Liq: {fmt_q24h(liq_total)}"
+        if liq_long is not None and liq_short is not None:
+            liq_str += f" (long {fmt_q24h(liq_long)} / short {fmt_q24h(liq_short)})"
+        lines.append(liq_str)
+    cvd_buy, cvd_sell = kwargs.get("cvd_buy"), kwargs.get("cvd_sell")
+    taker = kwargs.get("taker")
+    if cvd_buy is not None and cvd_sell is not None:
+        cvd_str = f"CVD: buy {fmt_q24h(cvd_buy)} / sell {fmt_q24h(cvd_sell)}"
+        if taker is not None:
+            cvd_str += f" · taker {taker:.2f}"
+        lines.append(cvd_str)
+    bid_10k, ask_10k = kwargs.get("bid_10k"), kwargs.get("ask_10k")
+    imb = kwargs.get("imb")
+    if bid_10k is not None and ask_10k is not None:
+        book_str = f"Book: bid {fmt_q24h(bid_10k)} ask {fmt_q24h(ask_10k)} imb {imb:+.2f}" if imb is not None else f"Book: bid {fmt_q24h(bid_10k)} ask {fmt_q24h(ask_10k)}"
+        lines.append(book_str)
+    book_walls = kwargs.get("book_walls")
+    if book_walls:
+        lines.append("  " + book_walls)
+    p24h = kwargs.get("p24h")
+    if p24h is not None:
+        lines.append(f"p24h: {p24h:+.2f}%")
+    extra = kwargs.get("extra_lines", [])
+    for x in extra:
+        if x:
+            lines.append(str(x))
+    hint = kwargs.get("hint")
+    if hint:
+        lines.append(hint)
+    return "\n".join(lines)
+
 
 def cached_latest(ring, default=0.0):
     if ring is None:
@@ -813,9 +869,16 @@ class Scanner:
         st = STATES.get(sym)
         if st is None:
             return
+        notional_usdt = float(notional_usdt)
+        price = float(price)
+        if LIQ_PRINT and notional_usdt >= LIQ_PRINT_MIN_USDT:
+            side_upper = str(side).upper()
+            # BUY = ликвидирован лонг, SELL = ликвидирован шорт
+            label = "LONG_LIQ" if side_upper == "BUY" else "SHORT_LIQ"
+            print(f"[LIQ] {sym} {label} {fmt_q24h(notional_usdt)} @ {price:.6g}")
         d = self._liq_deque(st)
         sign = +1.0 if str(side).upper() == "BUY" else -1.0
-        d.append((float(ts), sign * float(notional_usdt), float(price)))
+        d.append((float(ts), sign * notional_usdt, price))
 
     def _liq_window_stats(self, st, sec: float, now: Optional[float] = None) -> Tuple[float, float, float, float]:
         """Returns (buy_usdt, sell_usdt, total_usdt, imbalance). Supports (ts, signed) or (ts, signed, price)."""
@@ -1045,6 +1108,56 @@ class Scanner:
         imb_str = f" imb={imb:+.2f}" if imb is not None else ""
         return f"bid_10k={fmt_q24h(bid_10k)} ask_10k={fmt_q24h(ask_10k)}{imb_str}"
 
+    async def _get_depth_levels(
+        self, session: aiohttp.ClientSession, sym: str
+    ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]]]:
+        """Returns (bids, asks) — списки (price, notional_usdt) для уровней >= DEPTH_MIN_LEVEL_USDT, до DEPTH_LIMIT уровней."""
+        if not USE_DEPTH:
+            return [], []
+        url = "https://fapi.binance.com/fapi/v1/depth"
+        params = {"symbol": sym, "limit": DEPTH_LIMIT}
+        try:
+            async with session.get(url, params=params, timeout=6) as r:
+                j = await r.json()
+            bids_raw = j.get("bids") or []
+            asks_raw = j.get("asks") or []
+            bids = []
+            for row in bids_raw:
+                if len(row) < 2:
+                    continue
+                p, q = float(row[0]), float(row[1])
+                notional = p * q
+                if notional >= DEPTH_MIN_LEVEL_USDT:
+                    bids.append((p, notional))
+            asks = []
+            for row in asks_raw:
+                if len(row) < 2:
+                    continue
+                p, q = float(row[0]), float(row[1])
+                notional = p * q
+                if notional >= DEPTH_MIN_LEVEL_USDT:
+                    asks.append((p, notional))
+            return bids, asks
+        except Exception:
+            return [], []
+
+    def _fmt_book_walls(
+        self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], top_n: int = 4
+    ) -> str:
+        """Короткая строка для TG: где стенки (уровни от 10k). Пустоты не помечаем отдельно — видно по разреженности."""
+        parts = []
+        if bids:
+            top_b = bids[:top_n]
+            parts.append("Bid: " + " ".join(f"{p:.4g}@{fmt_q24h(n)}" for p, n in top_b))
+        else:
+            parts.append("Bid: —")
+        if asks:
+            top_a = asks[:top_n]
+            parts.append("Ask: " + " ".join(f"{p:.4g}@{fmt_q24h(n)}" for p, n in top_a))
+        else:
+            parts.append("Ask: —")
+        return " | ".join(parts)
+
     # ---------- Breakout HOLD state machine ----------
     def _breakout_hold_ok(self, st, bias: str, brk_now: bool, level: float, last_price: float, now: float) -> Tuple[bool, float, float]:
         """Returns (hold_ok, hold_age_sec, quality 0..1). quality = min(1, age/HOLD_SEC)."""
@@ -1212,8 +1325,8 @@ class Scanner:
                                             f"vol_accel={momo_accel:.2f}x — токен разогрет, смотри (шорт?)"
                                         )
                                         print(msg_pw)
-                                        signals.append((80.0 + min(p24h, 50.0), msg_pw))
-                                # В дампе (BULLA-тип): раз в кулдаун — "MM возит вверх-вниз"
+                                        out_pw = fmt_tg_alert(sym, "WATCH PUMPED_WATCH", "SHORT", move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel, p24h=p24h, extra_lines=["Токен разогрет, смотри (шорт?)"]) if TG_STRUCTURED else msg_pw
+                                        signals.append((80.0 + min(p24h, 50.0), out_pw))
                                 if p24h <= DUMPED_WATCH_P24H_MAX:
                                     last_dw = float(getattr(st, "dumped_watch_ts", 0.0))
                                     if (now - last_dw) >= DUMPED_WATCH_COOLDOWN_SEC:
@@ -1223,7 +1336,8 @@ class Scanner:
                                             f"vol_accel={momo_accel:.2f}x — в дампе, MM возит, смотри (лонг от дна? шорт?)"
                                         )
                                         print(msg_dw)
-                                        signals.append((78.0, msg_dw))
+                                        out_dw = fmt_tg_alert(sym, "WATCH DUMPED_WATCH", "—", move=momo_move, vol_accel=momo_accel, p24h=p24h, extra_lines=["В дампе, MM возит (лонг от дна? шорт?)"]) if TG_STRUCTURED else msg_dw
+                                        signals.append((78.0, out_dw))
                                 continue
                         else:  # MOMO_DOWN
                             if p24h < MOMO_P24H_MIN_DOWN or p24h > MOMO_P24H_MAX_DOWN:
@@ -1236,7 +1350,8 @@ class Scanner:
                                             f"в дампе, MM возит, смотри (лонг от дна? шорт?)"
                                         )
                                         print(msg_dw)
-                                        signals.append((78.0, msg_dw))
+                                        out_dw = fmt_tg_alert(sym, "WATCH DUMPED_WATCH", "—", move=momo_move, p24h=p24h, extra_lines=["В дампе, MM возит (лонг от дна? шорт?)"]) if TG_STRUCTURED else msg_dw
+                                        signals.append((78.0, out_dw))
                                 continue
 
                         momo_taker = cached_latest(getattr(st, "taker_ratio", None), default=None)
@@ -1281,38 +1396,53 @@ class Scanner:
 
                         hint = "OK" if not warn else ("CHECK: " + ", ".join(warn))
 
-
-
+                        liq_buy, liq_sell, _, _ = self._liq_window_stats(st, LIQ_WINDOW_SEC, now=now)
                         bid_10k, ask_10k, depth_imb, _ = await self._get_depth_stats(http, sym)
                         depth_str = f" | {self._fmt_depth(bid_10k, ask_10k, depth_imb)}" if USE_DEPTH and (bid_10k is not None or ask_10k is not None) else ""
                         msg = (
                             f"{sym} VERY_HOT {momo_tag}({ 'LONG' if momo_move>0 else 'SHORT' }) | "
                             f"move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | vol_accel={momo_accel:.2f}x | "
                             f"v_now={momo_v_now:.1f} v_base={momo_v_base:.1f} | "
-                            f"liq={momo_liq_total/1000:.0f}K | taker={momo_taker:.2f} basis={momo_basis:+.3f}% | p24h={p24h:.2f}%"
+                            f"liq={momo_liq_total/1000:.0f}K (long {liq_buy/1000:.0f}K/short {liq_sell/1000:.0f}K) | taker={momo_taker:.2f} basis={momo_basis:+.3f}% | p24h={p24h:.2f}%"
                             f"{depth_str} | {hint}"
                         )
                         print(msg)
                         rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
-                        # В TG только когда OK (без CHECK) + 5m тренд + поток в нашу сторону
                         send_to_tg = not warn
                         if send_to_tg and USE_5M_TREND_FILTER:
                             if momo_move > 0 and trend_5m_downtrend(st.price, now):
                                 send_to_tg = False
                             if momo_move < 0 and trend_5m_uptrend(st.price, now):
                                 send_to_tg = False
+                        buy_usdt, sell_usdt = None, None
                         if send_to_tg and USE_AGG_TRADES:
                             buy_usdt, sell_usdt = await self._get_agg_trades_flow(http, sym, last_sec=AGG_TRADES_LOOKBACK_SEC)
                             if buy_usdt is not None and sell_usdt is not None:
                                 total = buy_usdt + sell_usdt
-                                if total > 1000.0:  # минимум объёма
+                                if total > 1000.0:
                                     ratio = buy_usdt / total if momo_move > 0 else sell_usdt / total
                                     if ratio < AGG_TRADES_MIN_RATIO:
                                         send_to_tg = False
+                        if send_to_tg and TG_STRUCTURED and (buy_usdt is None or sell_usdt is None):
+                            buy_usdt, sell_usdt = await self._get_agg_trades_flow(http, sym, last_sec=CVD_SEC_IN_ALERT)
 
                         if send_to_tg:
-                            signals.append((rank, msg))
-                            # BOOK_UPDATE-трекинг только если реально был TG-алерт
+                            if TG_STRUCTURED:
+                                book_walls = ""
+                                if BOOK_WALLS_IN_TG and USE_DEPTH:
+                                    bids_l, asks_l = await self._get_depth_levels(http, sym)
+                                    book_walls = self._fmt_book_walls(bids_l, asks_l)
+                                tg_msg = fmt_tg_alert(
+                                    sym, "VERY_HOT " + momo_tag, "LONG" if momo_move > 0 else "SHORT",
+                                    move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel,
+                                    liq_total=momo_liq_total, liq_long=liq_buy, liq_short=liq_sell,
+                                    cvd_buy=buy_usdt, cvd_sell=sell_usdt, taker=momo_taker,
+                                    bid_10k=bid_10k, ask_10k=ask_10k, imb=depth_imb, book_walls=book_walls or None,
+                                    p24h=p24h, hint=hint if warn else None,
+                                )
+                                signals.append((rank, tg_msg))
+                            else:
+                                signals.append((rank, msg))
                             if USE_DEPTH and bid_10k is not None and ask_10k is not None:
                                 st.last_alert_bid_10k = bid_10k
                                 st.last_alert_ask_10k = ask_10k
@@ -1339,7 +1469,8 @@ class Scanner:
                             if retr >= 1.5 and taker <= 0.75 and basis < 0:
                                 msg = f"{sym} VERY_HOT FADE_SHORT | retr={retr:.2f}% | taker={taker:.2f} basis={basis:+.3f}%"
                                 print(msg)
-                                signals.append((120.0 + retr, msg))
+                                out_msg = fmt_tg_alert(sym, "VERY_HOT FADE_SHORT", "SHORT", taker=taker, extra_lines=[f"Retr: {retr:.2f}% · basis: {basis:+.3f}%"]) if TG_STRUCTURED else msg
+                                signals.append((120.0 + retr, out_msg))
                                 st.momo_peak_price = 0.0
 
                     # --- PRE_FORM: flat -> реальное начало движения (качество, не всё подряд) ---
@@ -1396,7 +1527,8 @@ class Scanner:
                                                     print(msg_pre)
                                                 self.book.upsert(sym, 70.0 + abs(move_pct_pre))
                                                 rank_pre = 85.0 + abs(move_pct_pre) + clamp(accel_pre, 0.0, 10.0)
-                                                signals.append((rank_pre, msg_pre))
+                                                out_pre = fmt_tg_alert(sym, f"WATCH {tag_pre}", bias_pre, move=move_pct_pre, vol_accel=accel_pre, p24h=p24h_pre, extra_lines=[f"Range: {range_pct_pre:.3f}% · recent: {move_recent:+.2f}%"]) if TG_STRUCTURED else msg_pre
+                                                signals.append((rank_pre, out_pre))
                                                 continue
 
                     ok_price, rng = price_compression(prices)
@@ -1533,7 +1665,8 @@ class Scanner:
                                             f"vol_accel={momo_accel:.2f}x — токен разогрет, смотри (шорт?)"
                                         )
                                         print(msg_pw)
-                                        signals.append((80.0 + min(p24h, 50.0), msg_pw))
+                                        out_pw = fmt_tg_alert(sym, "WATCH PUMPED_WATCH", "SHORT", move=momo_move, vol_accel=momo_accel, p24h=p24h, extra_lines=["Токен разогрет, смотри (шорт?)"]) if TG_STRUCTURED else msg_pw
+                                        signals.append((80.0 + min(p24h, 50.0), out_pw))
                                 if p24h <= DUMPED_WATCH_P24H_MAX:
                                     last_dw = float(getattr(st, "dumped_watch_ts", 0.0))
                                     if (now - last_dw) >= DUMPED_WATCH_COOLDOWN_SEC:
@@ -1543,7 +1676,8 @@ class Scanner:
                                             f"в дампе, MM возит, смотри (лонг от дна? шорт?)"
                                         )
                                         print(msg_dw)
-                                        signals.append((78.0, msg_dw))
+                                        out_dw = fmt_tg_alert(sym, "WATCH DUMPED_WATCH", "—", move=momo_move, p24h=p24h, extra_lines=["В дампе, MM возит (лонг от дна? шорт?)"]) if TG_STRUCTURED else msg_dw
+                                        signals.append((78.0, out_dw))
                                 continue
                         else:
                             if p24h < MOMO_P24H_MIN_DOWN or p24h > MOMO_P24H_MAX_DOWN:
@@ -1556,7 +1690,8 @@ class Scanner:
                                             f"в дампе, MM возит, смотри (лонг от дна? шорт?)"
                                         )
                                         print(msg_dw)
-                                        signals.append((78.0, msg_dw))
+                                        out_dw = fmt_tg_alert(sym, "WATCH DUMPED_WATCH", "—", move=momo_move, p24h=p24h, extra_lines=["В дампе, MM возит (лонг от дна? шорт?)"]) if TG_STRUCTURED else msg_dw
+                                        signals.append((78.0, out_dw))
                                 continue
                         momo_taker = cached_latest(getattr(st, "taker_ratio", None), default=None)
                         momo_basis = cached_latest(getattr(st, "basis_pct", None)) or cached_latest(getattr(st, "basis", None), default=None)
@@ -1566,10 +1701,12 @@ class Scanner:
                             momo_basis = await self._get_basis_pct(http, sym)
                         momo_taker = float(momo_taker or 1.0)
                         momo_basis = float(momo_basis or 0.0)
+                        liq_buy, liq_sell, _, _ = self._liq_window_stats(st, LIQ_WINDOW_SEC, now=now)
+                        bid_10k, ask_10k, depth_imb, _ = await self._get_depth_stats(http, sym)
                         msg = (
                             f"{sym} VERY_HOT {momo_tag}({'LONG' if momo_move > 0 else 'SHORT'}) | "
                             f"move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | vol_accel={momo_accel:.2f}x | "
-                            f"v_now={momo_v_now:.1f} v_base={momo_v_base:.1f} | liq={momo_liq_total/1000:.0f}K | "
+                            f"liq={momo_liq_total/1000:.0f}K (long {liq_buy/1000:.0f}K/short {liq_sell/1000:.0f}K) | "
                             f"taker={momo_taker:.2f} basis={momo_basis:+.3f}% | p24h={p24h:.2f}%"
                         )
                         print(msg)
@@ -1579,6 +1716,7 @@ class Scanner:
                                 send_s2 = False
                             if momo_move < 0 and trend_5m_uptrend(st.price, now):
                                 send_s2 = False
+                        buy_usdt, sell_usdt = None, None
                         if send_s2 and USE_AGG_TRADES:
                             buy_usdt, sell_usdt = await self._get_agg_trades_flow(http, sym, last_sec=AGG_TRADES_LOOKBACK_SEC)
                             if buy_usdt is not None and sell_usdt is not None and (buy_usdt + sell_usdt) > 1000.0:
@@ -1586,9 +1724,26 @@ class Scanner:
                                 ratio = buy_usdt / total if momo_move > 0 else sell_usdt / total
                                 if ratio < AGG_TRADES_MIN_RATIO:
                                     send_s2 = False
+                        if send_s2 and TG_STRUCTURED and (buy_usdt is None or sell_usdt is None):
+                            buy_usdt, sell_usdt = await self._get_agg_trades_flow(http, sym, last_sec=CVD_SEC_IN_ALERT)
                         if send_s2:
                             rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
-                            signals.append((rank, msg))
+                            if TG_STRUCTURED:
+                                book_walls = ""
+                                if BOOK_WALLS_IN_TG and USE_DEPTH:
+                                    bids_l, asks_l = await self._get_depth_levels(http, sym)
+                                    book_walls = self._fmt_book_walls(bids_l, asks_l)
+                                tg_msg = fmt_tg_alert(
+                                    sym, "VERY_HOT " + momo_tag, "LONG" if momo_move > 0 else "SHORT",
+                                    move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel,
+                                    liq_total=momo_liq_total, liq_long=liq_buy, liq_short=liq_sell,
+                                    cvd_buy=buy_usdt, cvd_sell=sell_usdt, taker=momo_taker,
+                                    bid_10k=bid_10k, ask_10k=ask_10k, imb=depth_imb, book_walls=book_walls or None,
+                                    p24h=p24h,
+                                )
+                                signals.append((rank, tg_msg))
+                            else:
+                                signals.append((rank, msg))
                         continue
 
                     ok_price, rng = price_compression(prices)
@@ -1767,7 +1922,7 @@ class Scanner:
                         f"score={setup_score:.1f} | "
                         f"fund={fmt_funding(fund_now)} dFund={fmt_funding(fund_delta)} | "
                         f"spike={sp_move:.2f}% vr={sp_vr:.2f}x | "
-                        f"liq={liq_total/1000:.0f}K imb={liq_imb:+.2f} | "
+                        f"liq={liq_total/1000:.0f}K (long {liq_buy/1000:.0f}K/short {liq_sell/1000:.0f}K) imb={liq_imb:+.2f} | "
                         f"taker={fmt_float_opt(taker_ratio,2)} basis={fmt_signed_pct_opt(basis_pct,3)} | "
                         f"trend={move_pct:.2f}% pos={pos:.2f}"
                     )
@@ -1794,7 +1949,28 @@ class Scanner:
                             rank += 5.0
                         if self._liq_cluster_near(st, last_price, LIQ_WINDOW_SEC, LIQ_CLUSTER_BUCKET_PCT, LIQ_NEAR_CLUSTER_PCT, now=now):
                             rank += 5.0
-                        signals.append((rank, msg))
+                        if TG_STRUCTURED:
+                            bid_10k, ask_10k, depth_imb, _ = await self._get_depth_stats(http, sym)
+                            buy_usdt, sell_usdt = await self._get_agg_trades_flow(http, sym, last_sec=CVD_SEC_IN_ALERT)
+                            book_walls = ""
+                            if BOOK_WALLS_IN_TG and USE_DEPTH:
+                                bids_l, asks_l = await self._get_depth_levels(http, sym)
+                                book_walls = self._fmt_book_walls(bids_l, asks_l)
+                            extra = [
+                                f"Range: {rng_pct:.3f}% · OI+: {oi_pct:.1f}% · score: {setup_score:.1f}",
+                                f"Fund: {fmt_funding(fund_now)} dFund: {fmt_funding(fund_delta)} · spike: {sp_move:.2f}% vr: {sp_vr:.2f}x",
+                            ]
+                            tg_msg = fmt_tg_alert(
+                                sym, f"{level} {tag_out}", bias,
+                                move=move_pct, vol_accel=accel,
+                                liq_total=liq_total, liq_long=liq_buy, liq_short=liq_sell,
+                                cvd_buy=buy_usdt, cvd_sell=sell_usdt, taker=float(taker_ratio) if taker_ratio is not None else None,
+                                bid_10k=bid_10k, ask_10k=ask_10k, imb=depth_imb, book_walls=book_walls or None,
+                                p24h=p24h, extra_lines=extra,
+                            )
+                            signals.append((rank, tg_msg))
+                        else:
+                            signals.append((rank, msg))
 
                 # ---------- BOOK_UPDATE: повтор по стакану для символов, по которым уже слали TG-алерт с глубиной ----------
                 if USE_DEPTH and USE_BOOK_UPDATE:
@@ -1822,12 +1998,20 @@ class Scanner:
                         pct_b = (abs(bid_10k - last_b) / last_b * 100.0) if last_b > 0 else (100.0 if bid_10k > 0 else 0.0)
                         pct_a = (abs(ask_10k - last_a) / last_a * 100.0) if last_a > 0 else (100.0 if ask_10k > 0 else 0.0)
                         if pct_b >= BOOK_UPDATE_MIN_CHANGE_PCT or pct_a >= BOOK_UPDATE_MIN_CHANGE_PCT:
-                            msg = (
+                            msg_console = (
                                 f"{sym} BOOK_UPDATE | было bid_10k={fmt_q24h(last_b)} ask_10k={fmt_q24h(last_a)} | "
                                 f"сейчас bid_10k={fmt_q24h(bid_10k)} ask_10k={fmt_q24h(ask_10k)} | imb={depth_imb:+.2f}"
                             )
-                            print(msg)
-                            signals.append((75.0, msg))
+                            print(msg_console)
+                            if TG_STRUCTURED:
+                                tg_msg = fmt_tg_alert(
+                                    sym, "BOOK_UPDATE", "—",
+                                    bid_10k=bid_10k, ask_10k=ask_10k, imb=depth_imb,
+                                    extra_lines=[f"Было: bid {fmt_q24h(last_b)} ask {fmt_q24h(last_a)}"],
+                                )
+                                signals.append((75.0, tg_msg))
+                            else:
+                                signals.append((75.0, msg_console))
                             st.last_alert_bid_10k = bid_10k
                             st.last_alert_ask_10k = ask_10k
                             st.last_alert_book_ts = now
