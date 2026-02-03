@@ -182,6 +182,17 @@ USE_BASIS = True
 BASIS_TTL_SEC = 30.0
 BASIS_MIN_ABS_PCT = 0.02      # abs(mark-index)/index % threshold to consider futures pressure
 
+# --- OI delta в алертах (то же окно 60–180с) ---
+OI_DELTA_WINDOW_SEC = 120
+
+# --- Liq density: концентрация ликвидаций во времени (short_sec / long_sec) ---
+LIQ_DENSITY_SHORT_SEC = 15.0
+LIQ_DENSITY_LONG_SEC = 60.0
+
+# --- Spot vs perp volume split ---
+USE_SPOT_PERP_VOL = True
+SPOT_VOL_TTL_SEC = 120.0
+
 # --- Alerts & Telegram batching ---
 LEVEL_RANK = {"IGNORE": 0, "WATCH": 1, "HOT": 2, "VERY_HOT": 3}
 ALERT_COOLDOWN = {"WATCH": 240, "HOT": 120, "VERY_HOT": 60}
@@ -254,12 +265,37 @@ def fmt_tg_alert(sym: str, signal_type: str, direction: str, **kwargs) -> str:
         lines.append(cvd_str)
     bid_10k, ask_10k = kwargs.get("bid_10k"), kwargs.get("ask_10k")
     imb = kwargs.get("imb")
+    spread_bps = kwargs.get("spread_bps")
+    depth_total = kwargs.get("depth_total")
     if bid_10k is not None and ask_10k is not None:
         book_str = f"Book: bid {fmt_q24h(bid_10k)} ask {fmt_q24h(ask_10k)} imb {imb:+.2f}" if imb is not None else f"Book: bid {fmt_q24h(bid_10k)} ask {fmt_q24h(ask_10k)}"
+        if spread_bps is not None:
+            book_str += f" · spread {spread_bps:.1f}bps"
+        if depth_total is not None and depth_total > 0:
+            book_str += f" · depth {fmt_q24h(depth_total)}"
         lines.append(book_str)
     book_walls = kwargs.get("book_walls")
     if book_walls:
         lines.append("  " + book_walls)
+    oi_delta_pct = kwargs.get("oi_delta_pct")
+    oi_delta_sec = kwargs.get("oi_delta_sec")
+    if oi_delta_pct is not None and oi_delta_sec is not None:
+        lines.append(f"OI Δ ({int(oi_delta_sec)}s): {oi_delta_pct:+.2f}%")
+    funding = kwargs.get("funding")
+    premium = kwargs.get("premium")
+    if funding is not None or premium is not None:
+        parts = []
+        if funding is not None:
+            parts.append(f"Funding: {fmt_funding(funding)}")
+        if premium is not None:
+            parts.append(f"Premium: {premium:+.3f}%")
+        lines.append(" · ".join(parts))
+    liq_density = kwargs.get("liq_density")
+    if liq_density is not None:
+        lines.append(f"Liq density: {liq_density:.2f} (burst in last {int(LIQ_DENSITY_SHORT_SEC)}s)")
+    spot_perp = kwargs.get("spot_perp_ratio")
+    if spot_perp is not None:
+        lines.append(f"Spot/Perp vol: {spot_perp:.2f}")
     p24h = kwargs.get("p24h")
     if p24h is not None:
         lines.append(f"p24h: {p24h:+.2f}%")
@@ -757,7 +793,8 @@ class Scanner:
         self._taker_cache: Dict[str, Tuple[float, float]] = {}
         self._basis_cache: Dict[str, Tuple[float, float]] = {}
         self._agg_trades_cache: Dict[str, Tuple[float, float, float]] = {}
-        self._depth_cache: Dict[str, Tuple[float, float, float, float, float]] = {}  # sym -> (ts, bid_10k, ask_10k, imb, ...)
+        self._depth_cache: Dict[str, Tuple] = {}  # sym -> (ts, bid_10k, ask_10k, imb, total, best_bid, best_ask, spread_bps)
+        self._spot_vol_cache: Dict[str, Tuple[float, float]] = {}  # sym -> (ts, spot_q24h)
 
     def _print_stats_if_due(self):
         now = time.time()
@@ -911,6 +948,15 @@ class Scanner:
 
         imb = 0.0 if total <= 0 else (buy - sell) / total
         return buy, sell, total, imb
+
+    def _liq_density(self, st, short_sec: float = 15.0, long_sec: float = 60.0, now: Optional[float] = None) -> Optional[float]:
+        """Доля ликвидаций в последние short_sec от ликвидаций за long_sec. >0.5 = концентрация (burst)."""
+        now = time.time() if now is None else float(now)
+        _, _, liq_long, _ = self._liq_window_stats(st, long_sec, now=now)
+        if liq_long <= 0:
+            return None
+        _, _, liq_short, _ = self._liq_window_stats(st, short_sec, now=now)
+        return liq_short / liq_long
 
     def _liq_cluster_near(self, st, price: float, sec: float, bucket_pct: float, near_pct: float, now: Optional[float] = None) -> bool:
         """True if price is within near_pct of a liquidation cluster level (bucket_pct)."""
@@ -1071,16 +1117,40 @@ class Scanner:
         except Exception:
             return None, None
 
+    async def _get_spot_perp_ratio(self, session: aiohttp.ClientSession, sym: str) -> Optional[float]:
+        """Spot 24h quote volume / Perp 24h quote volume. Берём perp q24h из state."""
+        if not USE_SPOT_PERP_VOL:
+            return None
+        now = time.time()
+        cached = self._spot_vol_cache.get(sym)
+        if cached and (now - cached[0] <= SPOT_VOL_TTL_SEC):
+            spot_q = cached[1]
+        else:
+            url = "https://api.binance.com/api/v3/ticker/24hr"
+            params = {"symbol": sym}
+            try:
+                async with session.get(url, params=params, timeout=6) as r:
+                    j = await r.json()
+                spot_q = float(j.get("quoteVolume", 0) or 0)
+                self._spot_vol_cache[sym] = (now, spot_q)
+            except Exception:
+                return None
+        st = STATES.get(sym)
+        perp_q = float(getattr(st, "q24h", 0) or 0)
+        if perp_q <= 0:
+            return None
+        return spot_q / perp_q
+
     async def _get_depth_stats(
         self, session: aiohttp.ClientSession, sym: str
-    ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
-        """Returns (bid_10k, ask_10k, imb, total_10k). Только уровни от DEPTH_MIN_LEVEL_USDT. imb = (bid-ask)/(bid+ask)."""
+    ) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float], Optional[float]]:
+        """Returns (bid_10k, ask_10k, imb, total_10k, best_bid, best_ask, spread_bps). spread_bps = spread/mid*1e4."""
         if not USE_DEPTH:
-            return None, None, None, None
+            return None, None, None, None, None, None, None
         now = time.time()
         cached = self._depth_cache.get(sym)
-        if cached and len(cached) >= 5 and (now - cached[0] <= DEPTH_TTL_SEC):
-            return cached[1], cached[2], cached[3], cached[4]
+        if cached and len(cached) >= 8 and (now - cached[0] <= DEPTH_TTL_SEC):
+            return cached[1], cached[2], cached[3], cached[4], cached[5], cached[6], cached[7]
         url = "https://fapi.binance.com/fapi/v1/depth"
         params = {"symbol": sym, "limit": DEPTH_LIMIT}
         try:
@@ -1088,6 +1158,10 @@ class Scanner:
                 j = await r.json()
             bids = j.get("bids") or []
             asks = j.get("asks") or []
+            best_bid = float(bids[0][0]) if bids and len(bids[0]) >= 1 else None
+            best_ask = float(asks[0][0]) if asks and len(asks[0]) >= 1 else None
+            mid = (best_bid + best_ask) / 2.0 if (best_bid and best_ask) else None
+            spread_bps = (best_ask - best_bid) / mid * 10000.0 if mid and mid > 0 else None
             bid_10k = 0.0
             ask_10k = 0.0
             for row in bids:
@@ -1106,10 +1180,10 @@ class Scanner:
                     ask_10k += notional
             total = bid_10k + ask_10k
             imb = (bid_10k - ask_10k) / total if total > 0 else 0.0
-            self._depth_cache[sym] = (now, bid_10k, ask_10k, imb, total)
-            return bid_10k, ask_10k, imb, total
+            self._depth_cache[sym] = (now, bid_10k, ask_10k, imb, total, best_bid, best_ask, spread_bps)
+            return bid_10k, ask_10k, imb, total, best_bid, best_ask, spread_bps
         except Exception:
-            return None, None, None, None
+            return None, None, None, None, None, None, None
 
     def _fmt_depth(self, bid_10k: Optional[float], ask_10k: Optional[float], imb: Optional[float]) -> str:
         if bid_10k is None or ask_10k is None:
@@ -1406,7 +1480,7 @@ class Scanner:
                         hint = "OK" if not warn else ("CHECK: " + ", ".join(warn))
 
                         liq_buy, liq_sell, _, _ = self._liq_window_stats(st, LIQ_WINDOW_SEC, now=now)
-                        bid_10k, ask_10k, depth_imb, _ = await self._get_depth_stats(http, sym)
+                        bid_10k, ask_10k, depth_imb, depth_total, _best_bid, _best_ask, spread_bps = await self._get_depth_stats(http, sym)
                         depth_str = f" | {self._fmt_depth(bid_10k, ask_10k, depth_imb)}" if USE_DEPTH and (bid_10k is not None or ask_10k is not None) else ""
                         msg = (
                             f"{sym} VERY_HOT {momo_tag}({ 'LONG' if momo_move>0 else 'SHORT' }) | "
@@ -1441,12 +1515,20 @@ class Scanner:
                                 if BOOK_WALLS_IN_TG and USE_DEPTH:
                                     bids_l, asks_l = await self._get_depth_levels(http, sym)
                                     book_walls = self._fmt_book_walls(bids_l, asks_l)
+                                oi_delta = oi_pct_change_recent(st.oi, OI_DELTA_WINDOW_SEC)
+                                fund_now = cached_latest(st.funding, default=None)
+                                liq_dens = self._liq_density(st, LIQ_DENSITY_SHORT_SEC, LIQ_DENSITY_LONG_SEC, now=now)
+                                spot_perp = await self._get_spot_perp_ratio(http, sym)
                                 tg_msg = fmt_tg_alert(
                                     sym, "VERY_HOT " + momo_tag, "LONG" if momo_move > 0 else "SHORT",
                                     move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel,
                                     liq_total=momo_liq_total, liq_long=liq_buy, liq_short=liq_sell,
                                     cvd_buy=buy_usdt, cvd_sell=sell_usdt, taker=momo_taker,
                                     bid_10k=bid_10k, ask_10k=ask_10k, imb=depth_imb, book_walls=book_walls or None,
+                                    spread_bps=spread_bps, depth_total=depth_total,
+                                    oi_delta_pct=oi_delta, oi_delta_sec=OI_DELTA_WINDOW_SEC,
+                                    funding=float(fund_now) if fund_now is not None else None,
+                                    premium=momo_basis, liq_density=liq_dens, spot_perp_ratio=spot_perp,
                                     p24h=p24h, hint=hint if warn else None,
                                 )
                                 signals.append((rank, tg_msg))
@@ -1711,7 +1793,7 @@ class Scanner:
                         momo_taker = float(momo_taker or 1.0)
                         momo_basis = float(momo_basis or 0.0)
                         liq_buy, liq_sell, _, _ = self._liq_window_stats(st, LIQ_WINDOW_SEC, now=now)
-                        bid_10k, ask_10k, depth_imb, _ = await self._get_depth_stats(http, sym)
+                        bid_10k, ask_10k, depth_imb, depth_total, _best_bid, _best_ask, spread_bps = await self._get_depth_stats(http, sym)
                         msg = (
                             f"{sym} VERY_HOT {momo_tag}({'LONG' if momo_move > 0 else 'SHORT'}) | "
                             f"move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | vol_accel={momo_accel:.2f}x | "
@@ -1742,12 +1824,20 @@ class Scanner:
                                 if BOOK_WALLS_IN_TG and USE_DEPTH:
                                     bids_l, asks_l = await self._get_depth_levels(http, sym)
                                     book_walls = self._fmt_book_walls(bids_l, asks_l)
+                                oi_delta = oi_pct_change_recent(st.oi, OI_DELTA_WINDOW_SEC)
+                                fund_now = cached_latest(st.funding, default=None)
+                                liq_dens = self._liq_density(st, LIQ_DENSITY_SHORT_SEC, LIQ_DENSITY_LONG_SEC, now=now)
+                                spot_perp = await self._get_spot_perp_ratio(http, sym)
                                 tg_msg = fmt_tg_alert(
                                     sym, "VERY_HOT " + momo_tag, "LONG" if momo_move > 0 else "SHORT",
                                     move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel,
                                     liq_total=momo_liq_total, liq_long=liq_buy, liq_short=liq_sell,
                                     cvd_buy=buy_usdt, cvd_sell=sell_usdt, taker=momo_taker,
                                     bid_10k=bid_10k, ask_10k=ask_10k, imb=depth_imb, book_walls=book_walls or None,
+                                    spread_bps=spread_bps, depth_total=depth_total,
+                                    oi_delta_pct=oi_delta, oi_delta_sec=OI_DELTA_WINDOW_SEC,
+                                    funding=float(fund_now) if fund_now is not None else None,
+                                    premium=momo_basis, liq_density=liq_dens, spot_perp_ratio=spot_perp,
                                     p24h=p24h,
                                 )
                                 signals.append((rank, tg_msg))
@@ -1959,12 +2049,14 @@ class Scanner:
                         if self._liq_cluster_near(st, last_price, LIQ_WINDOW_SEC, LIQ_CLUSTER_BUCKET_PCT, LIQ_NEAR_CLUSTER_PCT, now=now):
                             rank += 5.0
                         if TG_STRUCTURED:
-                            bid_10k, ask_10k, depth_imb, _ = await self._get_depth_stats(http, sym)
+                            bid_10k, ask_10k, depth_imb, depth_total, _best_bid, _best_ask, spread_bps = await self._get_depth_stats(http, sym)
                             buy_usdt, sell_usdt = await self._get_agg_trades_flow(http, sym, last_sec=CVD_SEC_IN_ALERT)
                             book_walls = ""
                             if BOOK_WALLS_IN_TG and USE_DEPTH:
                                 bids_l, asks_l = await self._get_depth_levels(http, sym)
                                 book_walls = self._fmt_book_walls(bids_l, asks_l)
+                            liq_dens = self._liq_density(st, LIQ_DENSITY_SHORT_SEC, LIQ_DENSITY_LONG_SEC, now=now)
+                            spot_perp = await self._get_spot_perp_ratio(http, sym)
                             extra = [
                                 f"Range: {rng_pct:.3f}% · OI+: {oi_pct:.1f}% · score: {setup_score:.1f}",
                                 f"Fund: {fmt_funding(fund_now)} dFund: {fmt_funding(fund_delta)} · spike: {sp_move:.2f}% vr: {sp_vr:.2f}x",
@@ -1975,6 +2067,11 @@ class Scanner:
                                 liq_total=liq_total, liq_long=liq_buy, liq_short=liq_sell,
                                 cvd_buy=buy_usdt, cvd_sell=sell_usdt, taker=float(taker_ratio) if taker_ratio is not None else None,
                                 bid_10k=bid_10k, ask_10k=ask_10k, imb=depth_imb, book_walls=book_walls or None,
+                                spread_bps=spread_bps, depth_total=depth_total,
+                                oi_delta_pct=oi_pct, oi_delta_sec=OI_DELTA_WINDOW_SEC,
+                                funding=float(fund_now) if fund_now is not None else None,
+                                premium=float(basis_pct) if basis_pct is not None else None,
+                                liq_density=liq_dens, spot_perp_ratio=spot_perp,
                                 p24h=p24h, extra_lines=extra,
                             )
                             signals.append((rank, tg_msg))
@@ -1994,7 +2091,7 @@ class Scanner:
                             continue
                         if (now - getattr(st, "last_book_update_alert_ts", 0.0)) < BOOK_UPDATE_COOLDOWN_SEC:
                             continue
-                        bid_10k, ask_10k, depth_imb, _ = await self._get_depth_stats(http, sym)
+                        bid_10k, ask_10k, depth_imb, depth_total, _best_bid, _best_ask, spread_bps = await self._get_depth_stats(http, sym)
                         if bid_10k is None or ask_10k is None:
                             continue
                         last_b = getattr(st, "last_alert_bid_10k", 0.0) or 0.0
