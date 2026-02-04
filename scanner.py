@@ -252,7 +252,10 @@ def fmt_tg_alert(sym: str, signal_type: str, direction: str, **kwargs) -> str:
     liq_long = kwargs.get("liq_long")
     liq_short = kwargs.get("liq_short")
     if liq_total is not None and liq_total >= 0:
-        liq_str = f"Liq: {fmt_q24h(liq_total)}"
+        total_show = liq_total
+        if liq_long is not None and liq_short is not None:
+            total_show = max(liq_total, liq_long + liq_short)
+        liq_str = f"Liq: {fmt_q24h(total_show)}"
         if liq_long is not None and liq_short is not None:
             liq_str += f" (long {fmt_q24h(liq_long)} / short {fmt_q24h(liq_short)})"
         lines.append(liq_str)
