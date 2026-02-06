@@ -193,6 +193,11 @@ LIQ_DENSITY_LONG_SEC = 60.0
 USE_SPOT_PERP_VOL = True
 SPOT_VOL_TTL_SEC = 120.0
 
+# --- Data quality (DQ): не торговать при плохих данных ---
+DQ_SCORE_MIN_TRADE = 70        # ниже — только WATCH / не слать VERY_HOT в TG
+MIN_BOOK_DEPTH_USDT = 8_000.0  # стакан "тонкий": bid_10k+ask_10k ниже — book N/A, не считать как вход
+OI_WINDOW_MIN_POINTS = 4       # минимум точек OI в окне для dq_oi_ok
+
 # --- Alerts & Telegram batching ---
 LEVEL_RANK = {"IGNORE": 0, "WATCH": 1, "HOT": 2, "VERY_HOT": 3}
 ALERT_COOLDOWN = {"WATCH": 240, "HOT": 120, "VERY_HOT": 60}
@@ -271,10 +276,14 @@ def fmt_tg_alert(sym: str, signal_type: str, direction: str, **kwargs) -> str:
     spread_bps = kwargs.get("spread_bps")
     depth_total = kwargs.get("depth_total")
     if bid_10k is not None and ask_10k is not None:
-        book_str = f"Book: bid {fmt_q24h(bid_10k)} ask {fmt_q24h(ask_10k)} imb {imb:+.2f}" if imb is not None else f"Book: bid {fmt_q24h(bid_10k)} ask {fmt_q24h(ask_10k)}"
+        thin = depth_total is not None and depth_total < MIN_BOOK_DEPTH_USDT
+        if thin:
+            book_str = "Book: N/A (thin)"
+        else:
+            book_str = f"Book: bid {fmt_q24h(bid_10k)} ask {fmt_q24h(ask_10k)} imb {imb:+.2f}" if imb is not None else f"Book: bid {fmt_q24h(bid_10k)} ask {fmt_q24h(ask_10k)}"
         if spread_bps is not None:
             book_str += f" · spread {spread_bps:.1f}bps"
-        if depth_total is not None and depth_total > 0:
+        if depth_total is not None and depth_total > 0 and not thin:
             book_str += f" · depth {fmt_q24h(depth_total)}"
         lines.append(book_str)
     book_walls = kwargs.get("book_walls")
@@ -302,6 +311,12 @@ def fmt_tg_alert(sym: str, signal_type: str, direction: str, **kwargs) -> str:
     p24h = kwargs.get("p24h")
     if p24h is not None:
         lines.append(f"p24h: {p24h:+.2f}%")
+    dq_line = kwargs.get("dq_line")
+    dq_score = kwargs.get("dq_score")
+    if dq_line:
+        lines.append(dq_line)
+    if dq_score is not None and dq_score < DQ_SCORE_MIN_TRADE:
+        lines.append("⚠ DQ<70 — не торговать")
     extra = kwargs.get("extra_lines", [])
     for x in extra:
         if x:
@@ -334,6 +349,30 @@ def fmt_float_opt(x: float | None, digits: int = 2) -> str:
 
 def fmt_signed_pct_opt(x: float | None, digits: int = 3) -> str:
     return "na" if x is None else f"{x:+.{digits}f}%"
+
+
+def compute_dq(
+    depth_total: Optional[float],
+    oi_points: int,
+    spot_ok: bool,
+    cvd_ok: bool,
+    liq_any: bool,
+) -> Tuple[int, str]:
+    """Возвращает (dq_score 0–100, строка для алерта). Каждый источник = 20 баллов."""
+    dq_book_ok = depth_total is not None and depth_total >= MIN_BOOK_DEPTH_USDT
+    dq_oi_ok = oi_points >= OI_WINDOW_MIN_POINTS
+    dq_spot_ok = spot_ok
+    dq_cvd_ok = cvd_ok
+    dq_liq_ok = liq_any  # хотя бы что-то по ликвидациям (окно есть)
+    parts = [
+        "book ok" if dq_book_ok else "book N/A(thin/fail)",
+        "OI ok" if dq_oi_ok else "OI N/A",
+        "spot ok" if dq_spot_ok else "spot N/A",
+        "liq ok" if dq_liq_ok else "liq N/A",
+        "cvd ok" if dq_cvd_ok else "cvd N/A",
+    ]
+    score = (dq_book_ok + dq_oi_ok + dq_spot_ok + dq_liq_ok + dq_cvd_ok) * 20
+    return score, f"DQ: {score} ({', '.join(parts)})"
 
 
 def ring_values(ring) -> List[float]:
@@ -1522,25 +1561,42 @@ class Scanner:
                                 fund_now = cached_latest(st.funding, default=None)
                                 liq_dens = self._liq_density(st, LIQ_DENSITY_SHORT_SEC, LIQ_DENSITY_LONG_SEC, now=now)
                                 spot_perp = await self._get_spot_perp_ratio(http, sym)
-                                tg_msg = fmt_tg_alert(
-                                    sym, "VERY_HOT " + momo_tag, "LONG" if momo_move > 0 else "SHORT",
-                                    move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel,
-                                    liq_total=momo_liq_total, liq_long=liq_buy, liq_short=liq_sell,
-                                    cvd_buy=buy_usdt, cvd_sell=sell_usdt, taker=momo_taker,
-                                    bid_10k=bid_10k, ask_10k=ask_10k, imb=depth_imb, book_walls=book_walls or None,
-                                    spread_bps=spread_bps, depth_total=depth_total,
-                                    oi_delta_pct=oi_delta, oi_delta_sec=OI_DELTA_WINDOW_SEC,
-                                    funding=float(fund_now) if fund_now is not None else None,
-                                    premium=momo_basis, liq_density=liq_dens, spot_perp_ratio=spot_perp,
-                                    p24h=p24h, hint=hint if warn else None,
+                                oi_win = ring_window(st.oi, OI_DELTA_WINDOW_SEC, now=now)
+                                dq_score, dq_line = compute_dq(
+                                    depth_total=depth_total,
+                                    oi_points=len(oi_win),
+                                    spot_ok=(spot_perp is not None),
+                                    cvd_ok=(buy_usdt is not None and sell_usdt is not None),
+                                    liq_any=(liq_buy + liq_sell > 0),
                                 )
-                                signals.append((rank, tg_msg))
+                                if dq_score < DQ_SCORE_MIN_TRADE:
+                                    send_to_tg = False
+                                if send_to_tg:
+                                    tg_msg = fmt_tg_alert(
+                                        sym, "VERY_HOT " + momo_tag, "LONG" if momo_move > 0 else "SHORT",
+                                        move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel,
+                                        liq_total=momo_liq_total, liq_long=liq_buy, liq_short=liq_sell,
+                                        cvd_buy=buy_usdt, cvd_sell=sell_usdt, taker=momo_taker,
+                                        bid_10k=bid_10k, ask_10k=ask_10k, imb=depth_imb, book_walls=book_walls or None,
+                                        spread_bps=spread_bps, depth_total=depth_total,
+                                        oi_delta_pct=oi_delta, oi_delta_sec=OI_DELTA_WINDOW_SEC,
+                                        funding=float(fund_now) if fund_now is not None else None,
+                                        premium=momo_basis, liq_density=liq_dens, spot_perp_ratio=spot_perp,
+                                        p24h=p24h, hint=hint if warn else None,
+                                        dq_score=dq_score, dq_line=dq_line,
+                                    )
+                                    signals.append((rank, tg_msg))
+                                    if USE_DEPTH and bid_10k is not None and ask_10k is not None:
+                                        st.last_alert_bid_10k = bid_10k
+                                        st.last_alert_ask_10k = ask_10k
+                                        st.last_alert_book_ts = now
                             else:
-                                signals.append((rank, msg))
-                            if USE_DEPTH and bid_10k is not None and ask_10k is not None:
-                                st.last_alert_bid_10k = bid_10k
-                                st.last_alert_ask_10k = ask_10k
-                                st.last_alert_book_ts = now
+                                if send_to_tg:
+                                    signals.append((rank, msg))
+                                    if USE_DEPTH and bid_10k is not None and ask_10k is not None:
+                                        st.last_alert_bid_10k = bid_10k
+                                        st.last_alert_ask_10k = ask_10k
+                                        st.last_alert_book_ts = now
 
                         if momo_tag == "MOMO_UP":
                             st.momo_peak_price = float(prices[-1]) if prices else 0.0
@@ -1831,19 +1887,28 @@ class Scanner:
                                 fund_now = cached_latest(st.funding, default=None)
                                 liq_dens = self._liq_density(st, LIQ_DENSITY_SHORT_SEC, LIQ_DENSITY_LONG_SEC, now=now)
                                 spot_perp = await self._get_spot_perp_ratio(http, sym)
-                                tg_msg = fmt_tg_alert(
-                                    sym, "VERY_HOT " + momo_tag, "LONG" if momo_move > 0 else "SHORT",
-                                    move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel,
-                                    liq_total=momo_liq_total, liq_long=liq_buy, liq_short=liq_sell,
-                                    cvd_buy=buy_usdt, cvd_sell=sell_usdt, taker=momo_taker,
-                                    bid_10k=bid_10k, ask_10k=ask_10k, imb=depth_imb, book_walls=book_walls or None,
-                                    spread_bps=spread_bps, depth_total=depth_total,
-                                    oi_delta_pct=oi_delta, oi_delta_sec=OI_DELTA_WINDOW_SEC,
-                                    funding=float(fund_now) if fund_now is not None else None,
-                                    premium=momo_basis, liq_density=liq_dens, spot_perp_ratio=spot_perp,
-                                    p24h=p24h,
+                                oi_win = ring_window(st.oi, OI_DELTA_WINDOW_SEC, now=now)
+                                dq_score, dq_line = compute_dq(
+                                    depth_total=depth_total,
+                                    oi_points=len(oi_win),
+                                    spot_ok=(spot_perp is not None),
+                                    cvd_ok=(buy_usdt is not None and sell_usdt is not None),
+                                    liq_any=(liq_buy + liq_sell > 0),
                                 )
-                                signals.append((rank, tg_msg))
+                                if dq_score >= DQ_SCORE_MIN_TRADE:
+                                    tg_msg = fmt_tg_alert(
+                                        sym, "VERY_HOT " + momo_tag, "LONG" if momo_move > 0 else "SHORT",
+                                        move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel,
+                                        liq_total=momo_liq_total, liq_long=liq_buy, liq_short=liq_sell,
+                                        cvd_buy=buy_usdt, cvd_sell=sell_usdt, taker=momo_taker,
+                                        bid_10k=bid_10k, ask_10k=ask_10k, imb=depth_imb, book_walls=book_walls or None,
+                                        spread_bps=spread_bps, depth_total=depth_total,
+                                        oi_delta_pct=oi_delta, oi_delta_sec=OI_DELTA_WINDOW_SEC,
+                                        funding=float(fund_now) if fund_now is not None else None,
+                                        premium=momo_basis, liq_density=liq_dens, spot_perp_ratio=spot_perp,
+                                        p24h=p24h, dq_score=dq_score, dq_line=dq_line,
+                                    )
+                                    signals.append((rank, tg_msg))
                             else:
                                 signals.append((rank, msg))
                         continue
