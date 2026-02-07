@@ -123,6 +123,13 @@ PUMPED_WATCH_P24H_MIN = 25.0
 PUMPED_WATCH_COOLDOWN_SEC = 7200
 DUMPED_WATCH_P24H_MAX = -50.0   # p24h ниже = "в дампе", раз в кулдаун слать WATCH (MM возит вверх-вниз)
 DUMPED_WATCH_COOLDOWN_SEC = 7200
+# После лонг-колла: трекинг отката и повторного лонга (SIREN-тип)
+RETRACE_AFTER_LONG_PCT = 5.0         # откат от цены алерта на X% → "WATCH: retrace after long"
+RETRACE_AFTER_LONG_WINDOW_SEC = 3600 # трекать 1 час после лонг-колла
+RETRACE_ALERT_COOLDOWN_SEC = 600     # не спамить retrace чаще раз в 10 мин
+RECOVERY_LONG_P24H_MIN = -25.0       # после дампа: p24h в [-25, -12) = зона "recovery"
+RECOVERY_LONG_MIN_MOVE_PCT = 3.0     # минимум движения вверх для RECOVERY_LONG
+RECOVERY_LONG_COOLDOWN_SEC = 600     # один RECOVERY_LONG раз в 10 мин на символ
 FLAT_RANGE_60S_MAX_PCT = 0.12
 USE_AGG_TRADES = True
 AGG_TRADES_LOOKBACK_SEC = 60
@@ -1269,7 +1276,7 @@ class Scanner:
     def _fmt_book_walls(
         self, bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], top_n: int = 4
     ) -> str:
-        """Короткая строка для TG: где стенки (уровни от 10k). Пустоты не помечаем отдельно — видно по разреженности."""
+        """Короткая строка для TG: где стенки (уровни от 10k). + Resistance/Support из лучших уровней."""
         parts = []
         if bids:
             top_b = bids[:top_n]
@@ -1281,7 +1288,12 @@ class Scanner:
             parts.append("Ask: " + " ".join(f"{p:.4g}@{fmt_q24h(n)}" for p, n in top_a))
         else:
             parts.append("Ask: —")
-        return " | ".join(parts)
+        wall_line = " | ".join(parts)
+        if bids and asks:
+            sup = f"Support: {bids[0][0]:.4g}@{fmt_q24h(bids[0][1])}"
+            res = f"Resistance: {asks[0][0]:.4g}@{fmt_q24h(asks[0][1])}"
+            wall_line += "\n  " + sup + " | " + res
+        return wall_line
 
     # ---------- Breakout HOLD state machine ----------
     def _breakout_hold_ok(self, st, bias: str, brk_now: bool, level: float, last_price: float, now: float) -> Tuple[bool, float, float]:
@@ -1335,6 +1347,10 @@ class Scanner:
         if tag.startswith("PUMPED_WATCH"):
             return True
         if tag.startswith("DUMPED_WATCH"):
+            return True
+        if tag.startswith("RECOVERY_LONG"):
+            return True
+        if "retrace after long" in (tag or "").lower():
             return True
 
         # Сигналы "высокого доверия" — шлём всегда (но анти-спам/rl всё равно сработает ниже по коду)
@@ -1422,6 +1438,22 @@ class Scanner:
                         if lo_60 > 0 and (hi_60 - lo_60) / lo_60 * 100.0 < FLAT_RANGE_60S_MAX_PCT:
                             continue
 
+                    # --- Retrace after long: откат от цены последнего MOMO_UP алерта ---
+                    last_ml_ts = float(getattr(st, "last_momo_long_ts", 0.0))
+                    if last_ml_ts > 0 and (now - last_ml_ts) <= RETRACE_AFTER_LONG_WINDOW_SEC:
+                        last_ml_price = float(getattr(st, "last_momo_long_price", 0.0))
+                        if last_ml_price > 0 and len(prices) > 0:
+                            cur_price = float(prices[-1])
+                            if cur_price < last_ml_price * (1.0 - RETRACE_AFTER_LONG_PCT / 100.0):
+                                last_ra_ts = float(getattr(st, "last_retrace_alert_ts", 0.0))
+                                if (now - last_ra_ts) >= RETRACE_ALERT_COOLDOWN_SEC:
+                                    st.last_retrace_alert_ts = now
+                                    retr_pct = (last_ml_price - cur_price) / last_ml_price * 100.0
+                                    msg_ra = f"{sym} WATCH retrace after long | -{retr_pct:.2f}% от лонг-колла"
+                                    print(msg_ra)
+                                    out_ra = fmt_tg_alert(sym, "WATCH retrace after long", "—", extra_lines=[f"Откат -{retr_pct:.2f}% от лонг-колла"]) if TG_STRUCTURED else msg_ra
+                                    signals.append((85.0, out_ra))
+
                     # --- MOMO / IMPULSE (ловим сильные пампы/дампы без compression) ---
                     momo_ok, momo_tag, momo_move, momo_accel, momo_v_now, momo_v_base, momo_taker, momo_basis, momo_liq_total = self._momo_impulse(sym, st, now)
                     best = float(getattr(st, "momo_best_abs", 0.0))
@@ -1440,6 +1472,19 @@ class Scanner:
                         # Не входить когда уже некуда падать / уже разогнано
                         if momo_move > 0:  # MOMO_UP
                             if p24h < MOMO_P24H_MIN_UP or p24h > MOMO_P24H_MAX_UP:
+                                # Recovery после дампа: p24h в [-25, -12), сильная свеча вверх → RECOVERY_LONG (SIREN-тип)
+                                if RECOVERY_LONG_P24H_MIN <= p24h < MOMO_P24H_MIN_UP and momo_move >= RECOVERY_LONG_MIN_MOVE_PCT:
+                                    last_rc = float(getattr(st, "recovery_long_ts", 0.0))
+                                    if (now - last_rc) >= RECOVERY_LONG_COOLDOWN_SEC:
+                                        st.recovery_long_ts = now
+                                        msg_rc = (
+                                            f"{sym} VERY_HOT RECOVERY_LONG (LONG) | move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s p24h={p24h:.1f}% | "
+                                            f"vol_accel={momo_accel:.2f}x — отскок после дампа"
+                                        )
+                                        print(msg_rc)
+                                        out_rc = fmt_tg_alert(sym, "VERY_HOT RECOVERY_LONG", "LONG", move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel, p24h=p24h, extra_lines=["Отскок после дампа"]) if TG_STRUCTURED else msg_rc
+                                        signals.append((105.0 + min(momo_move, 15.0), out_rc))
+                                        continue
                                 # BULLA-тип: хотя бы один алерт "токен в движении"
                                 if p24h >= PUMPED_WATCH_P24H_MIN:
                                     last_pw = float(getattr(st, "pumped_watch_ts", 0.0))
@@ -1601,6 +1646,9 @@ class Scanner:
                         if momo_tag == "MOMO_UP":
                             st.momo_peak_price = float(prices[-1]) if prices else 0.0
                             st.momo_peak_ts = now
+                            if send_to_tg:
+                                st.last_momo_long_price = float(prices[-1]) if prices else 0.0
+                                st.last_momo_long_ts = now
                         self.book.upsert(sym, 95.0 + clamp(abs(momo_move), 0.0, 20.0))
                         continue
 
