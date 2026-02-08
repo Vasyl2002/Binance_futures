@@ -200,10 +200,34 @@ LIQ_DENSITY_LONG_SEC = 60.0
 USE_SPOT_PERP_VOL = True
 SPOT_VOL_TTL_SEC = 120.0
 
+# --- RSI / MACD / VWAP (фильтры перекупленности и подтверждение momentum) ---
+RSI_PERIOD = 14
+RSI_MAX_LONG = 70.0            # MOMO_UP только если RSI < 70 (не перекуплен)
+RSI_MIN_SHORT = 30.0          # MOMO_DOWN только если RSI > 30 (не перепродан)
+USE_RSI_FILTER = True
+MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
+MACD_MIN_POINTS = 50          # минимум точек для MACD
+USE_MACD_FILTER = True        # long: MACD line > signal и histogram растёт
+VWAP_SESSION_SEC = 900        # VWAP за последние 15 мин (session)
+USE_VWAP_BIAS = True           # price > VWAP = bullish bias в подсказке
+# Funding skew: не лонжить при экстремальном положительном funding и росте
+FUNDING_SKEW_MAX_LONG = 0.001   # 0.1% — выше + рост = фильтр long
+FUNDING_SKEW_MIN_SHORT = -0.001 # -0.1% — ниже + падение = фильтр short
+USE_FUNDING_SKEW_FILTER = True
+# Delta (CVD): положительный delta + vol accel = реальное давление
+USE_DELTA_IN_ALERT = True     # показывать delta = buy_usdt - sell_usdt в алерте
+DELTA_MIN_LONG = 0.0          # для MOMO_UP желательно delta > 0 (опционально)
+# Weighted OBI и slippage (стакан)
+OBI_LEVELS = 10               # уровней для weighted OBI
+SLIPPAGE_SIZE_USDT = 20_000.0 # размер для оценки проскальзывания (20K)
+USE_WEIGHTED_OBI = True
+USE_SLIPPAGE_IN_ALERT = False # опционально в алерте
+
 # --- Data quality (DQ): не торговать при плохих данных ---
 DQ_SCORE_MIN_TRADE = 70        # ниже — только WATCH / не слать VERY_HOT в TG
 MIN_BOOK_DEPTH_USDT = 8_000.0  # стакан "тонкий": bid_10k+ask_10k ниже — book N/A, не считать как вход
 OI_WINDOW_MIN_POINTS = 4       # минимум точек OI в окне для dq_oi_ok
+DQ_MACD_BONUS = 10            # +10 к DQ если MACD подтверждает направление (макс 100)
 
 # --- Alerts & Telegram batching ---
 LEVEL_RANK = {"IGNORE": 0, "WATCH": 1, "HOT": 2, "VERY_HOT": 3}
@@ -318,6 +342,24 @@ def fmt_tg_alert(sym: str, signal_type: str, direction: str, **kwargs) -> str:
     p24h = kwargs.get("p24h")
     if p24h is not None:
         lines.append(f"p24h: {p24h:+.2f}%")
+    rsi = kwargs.get("rsi")
+    if rsi is not None:
+        lines.append(f"RSI(14): {rsi:.1f}")
+    macd_hist = kwargs.get("macd_hist")
+    if macd_hist is not None:
+        lines.append(f"MACD hist: {macd_hist:+.4g}")
+    vwap_bias = kwargs.get("vwap_bias")
+    if vwap_bias is not None:
+        lines.append(f"VWAP: {vwap_bias}")
+    cvd_delta = kwargs.get("cvd_delta")
+    if cvd_delta is not None and USE_DELTA_IN_ALERT:
+        lines.append(f"Delta: {fmt_q24h(abs(cvd_delta))} {'buy' if cvd_delta >= 0 else 'sell'}")
+    weighted_obi_val = kwargs.get("weighted_obi")
+    if weighted_obi_val is not None and USE_WEIGHTED_OBI:
+        lines.append(f"OBI(w): {weighted_obi_val:+.2f}")
+    slippage_bps_val = kwargs.get("slippage_bps")
+    if slippage_bps_val is not None and USE_SLIPPAGE_IN_ALERT:
+        lines.append(f"Slippage({SLIPPAGE_SIZE_USDT/1000:.0f}K): {slippage_bps_val:+.1f}bps")
     dq_line = kwargs.get("dq_line")
     dq_score = kwargs.get("dq_score")
     if dq_line:
@@ -364,8 +406,9 @@ def compute_dq(
     spot_ok: bool,
     cvd_ok: bool,
     liq_any: bool,
+    macd_ok: bool = False,
 ) -> Tuple[int, str]:
-    """Возвращает (dq_score 0–100, строка для алерта). Каждый источник = 20 баллов."""
+    """Возвращает (dq_score 0–100, строка для алерта). Каждый источник = 20 баллов; +DQ_MACD_BONUS если macd_ok."""
     dq_book_ok = depth_total is not None and depth_total >= MIN_BOOK_DEPTH_USDT
     dq_oi_ok = oi_points >= OI_WINDOW_MIN_POINTS
     dq_spot_ok = spot_ok
@@ -379,6 +422,9 @@ def compute_dq(
         "cvd ok" if dq_cvd_ok else "cvd N/A",
     ]
     score = (dq_book_ok + dq_oi_ok + dq_spot_ok + dq_liq_ok + dq_cvd_ok) * 20
+    if macd_ok:
+        score = min(100, score + DQ_MACD_BONUS)
+        parts.append("MACD ok")
     return score, f"DQ: {score} ({', '.join(parts)})"
 
 
@@ -526,6 +572,133 @@ def ma_sma(prices: List[float], n: int) -> Optional[float]:
     if len(prices) < n:
         return None
     return sum(prices[-n:]) / n
+
+
+def _ema(values: List[float], period: int) -> List[float]:
+    """EMA of values; returns list of same length, first (period-1) are None-filled as 0 for indexing."""
+    if len(values) < period:
+        return []
+    k = 2.0 / (period + 1)
+    out: List[float] = []
+    ema_prev = sum(values[:period]) / period
+    for i in range(period - 1):
+        out.append(0.0)
+    out.append(ema_prev)
+    for i in range(period, len(values)):
+        ema_prev = values[i] * k + ema_prev * (1.0 - k)
+        out.append(ema_prev)
+    return out
+
+
+def calc_rsi(prices: List[float], period: int = 14) -> Optional[float]:
+    """RSI(period). Needs at least period+1 points."""
+    if len(prices) < period + 1:
+        return None
+    gains, losses = [], []
+    for i in range(len(prices) - period, len(prices) - 1):
+        ch = prices[i + 1] - prices[i]
+        gains.append(ch if ch > 0 else 0.0)
+        losses.append(-ch if ch < 0 else 0.0)
+    avg_gain = sum(gains) / period
+    avg_loss = sum(losses) / period
+    if avg_loss <= 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def calc_macd(
+    prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9
+) -> Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]:
+    """Returns (macd_line, signal_line, histogram, histogram_slope). histogram_slope = current - prev."""
+    if len(prices) < slow + signal:
+        return None, None, None, None
+    ema_f = _ema(prices, fast)
+    ema_s = _ema(prices, slow)
+    if len(ema_f) < len(prices) or len(ema_s) < len(prices):
+        return None, None, None, None
+    macd_line = [ema_f[i] - ema_s[i] for i in range(slow - 1, len(prices))]
+    if len(macd_line) < signal + 1:
+        return None, None, None, None
+    sig_ema = _ema(macd_line, signal)
+    if len(sig_ema) < len(macd_line):
+        return None, None, None, None
+    hist = macd_line[-1] - sig_ema[-1]
+    hist_prev = macd_line[-2] - sig_ema[-2] if len(macd_line) >= 2 and len(sig_ema) >= 2 else hist
+    slope = hist - hist_prev
+    return macd_line[-1], sig_ema[-1], hist, slope
+
+
+def calc_vwap(price_ring, volume_ring, sec: float, now: float) -> Optional[float]:
+    """VWAP over last sec: sum(typical_price * vol) / sum(vol). typical_price = (h+l+c)/3 or just price."""
+    w_p = ring_window_prices(price_ring, sec, now)
+    w_v = ring_window(volume_ring, sec, now=now)
+    if not w_p or not w_v:
+        return None
+    vol_by_ts: Dict[float, float] = {float(t): float(v) for t, v in w_v}
+    pv_sum = 0.0
+    v_sum = 0.0
+    for ts, p in w_p:
+        v = vol_by_ts.get(float(ts), 0.0)
+        if v > 0:
+            pv_sum += float(p) * v
+            v_sum += v
+    if v_sum <= 0:
+        return None
+    return pv_sum / v_sum
+
+
+def funding_skew_filter(fund_now: Optional[float], fund_delta: float, bias: str) -> bool:
+    """True = фильтровать (не пускать). Long при funding высоком и растущем — не пускать."""
+    if fund_now is None or not USE_FUNDING_SKEW_FILTER:
+        return False
+    if bias == "LONG" and fund_now > FUNDING_SKEW_MAX_LONG and fund_delta > 0:
+        return True
+    if bias == "SHORT" and fund_now < FUNDING_SKEW_MIN_SHORT and fund_delta < 0:
+        return True
+    return False
+
+
+def weighted_obi(
+    bids: List[Tuple[float, float]], asks: List[Tuple[float, float]], mid: float, n_levels: int = 10
+) -> Optional[float]:
+    """Weighted order book imbalance. weight decays with distance from mid. Returns (bid_w - ask_w)/(bid_w + ask_w) ~ [-1,1]."""
+    if not bids or not asks or mid <= 0:
+        return None
+    k = 2.0
+    bid_w_sum = 0.0
+    ask_w_sum = 0.0
+    for i, (p, n) in enumerate(bids[:n_levels]):
+        dist_pct = abs(p - mid) / mid * 100.0
+        w = 1.0 / (1.0 + k * dist_pct)
+        bid_w_sum += n * w
+    for i, (p, n) in enumerate(asks[:n_levels]):
+        dist_pct = abs(p - mid) / mid * 100.0
+        w = 1.0 / (1.0 + k * dist_pct)
+        ask_w_sum += n * w
+    total = bid_w_sum + ask_w_sum
+    if total <= 0:
+        return None
+    return (bid_w_sum - ask_w_sum) / total
+
+
+def slippage_bps(levels: List[Tuple[float, float]], side: str, size_usdt: float, mid: float) -> Optional[float]:
+    """Walk the book to fill size_usdt; return (avg_fill_price - mid) / mid * 10000. side='buy' -> use asks, 'sell' -> use bids."""
+    if not levels or mid <= 0 or size_usdt <= 0:
+        return None
+    filled_usdt = 0.0
+    total_qty = 0.0
+    for p, notional in levels:
+        if filled_usdt >= size_usdt:
+            break
+        take_usdt = min(notional, size_usdt - filled_usdt)
+        p_f = float(p)
+        filled_usdt += take_usdt
+        total_qty += take_usdt / p_f if p_f > 0 else 0
+    if total_qty <= 0 or filled_usdt <= 0:
+        return None
+    avg_price = filled_usdt / total_qty
+    return (avg_price - mid) / mid * 10000.0
 
 
 def ma_alignment_ok(prices: List[float], bias: str, short_n: int = 7, long_n: int = 25) -> bool:
@@ -1566,6 +1739,37 @@ class Scanner:
 
                         hint = "OK" if not warn else ("CHECK: " + ", ".join(warn))
 
+                        # --- RSI / MACD / VWAP (фильтры перекупленности и подтверждение momentum) ---
+                        rsi = calc_rsi(prices, RSI_PERIOD) if len(prices) >= RSI_PERIOD + 1 else None
+                        macd_line, macd_sig, macd_hist, macd_slope = (None, None, None, None)
+                        if len(prices) >= MACD_MIN_POINTS:
+                            macd_line, macd_sig, macd_hist, macd_slope = calc_macd(prices, MACD_FAST, MACD_SLOW, MACD_SIGNAL)
+                        vwap = calc_vwap(st.price, st.volume, VWAP_SESSION_SEC, now) if getattr(st, "volume", None) else None
+                        fund_delta_300, _fd_now, _ = funding_delta_recent(st.funding, 300) if getattr(st, "funding", None) else (0.0, 0.0, False)
+                        macd_ok = False
+                        if momo_move > 0 and macd_line is not None and macd_sig is not None and macd_slope is not None:
+                            macd_ok = (macd_line > macd_sig and macd_slope > 0)
+                        elif momo_move < 0 and macd_line is not None and macd_sig is not None and macd_slope is not None:
+                            macd_ok = (macd_line < macd_sig and macd_slope < 0)
+                        last_p = float(prices[-1]) if prices else 0.0
+                        vwap_bias = None
+                        if USE_VWAP_BIAS and vwap is not None and last_p > 0:
+                            vwap_bias = "above (bullish)" if last_p > vwap else "below (bearish)"
+
+                        fund_now_temp = cached_latest(st.funding, default=None)
+                        if fund_now_temp is not None and funding_skew_filter(fund_now_temp, fund_delta_300, "LONG" if momo_move > 0 else "SHORT"):
+                            warn.append("funding skew (overheated)")
+                        if USE_RSI_FILTER and rsi is not None:
+                            if momo_move > 0 and rsi >= RSI_MAX_LONG:
+                                warn.append(f"RSI {rsi:.1f} overbought")
+                            if momo_move < 0 and rsi <= RSI_MIN_SHORT:
+                                warn.append(f"RSI {rsi:.1f} oversold")
+                        if USE_MACD_FILTER and not macd_ok and (macd_line is not None and macd_sig is not None):
+                            warn.append("MACD no confirm")
+                        hint = "OK" if not warn else ("CHECK: " + ", ".join(warn))
+                        if vwap_bias:
+                            hint = (hint + f" | VWAP {vwap_bias}") if hint else f"VWAP {vwap_bias}"
+
                         liq_buy, liq_sell, _, _ = self._liq_window_stats(st, LIQ_WINDOW_SEC, now=now)
                         bid_10k, ask_10k, depth_imb, depth_total, _best_bid, _best_ask, spread_bps = await self._get_depth_stats(http, sym)
                         depth_str = f" | {self._fmt_depth(bid_10k, ask_10k, depth_imb)}" if USE_DEPTH and (bid_10k is not None or ask_10k is not None) else ""
@@ -1599,9 +1803,15 @@ class Scanner:
                         if send_to_tg:
                             if TG_STRUCTURED:
                                 book_walls = ""
+                                obi_val, slippage_bps_val = None, None
                                 if BOOK_WALLS_IN_TG and USE_DEPTH:
                                     bids_l, asks_l = await self._get_depth_levels(http, sym)
                                     book_walls = self._fmt_book_walls(bids_l, asks_l)
+                                    if _best_bid is not None and _best_ask is not None and bids_l and asks_l:
+                                        mid = (_best_bid + _best_ask) / 2.0
+                                        obi_val = weighted_obi(bids_l, asks_l, mid, OBI_LEVELS) if USE_WEIGHTED_OBI else None
+                                        if USE_SLIPPAGE_IN_ALERT:
+                                            slippage_bps_val = slippage_bps(asks_l, "buy", SLIPPAGE_SIZE_USDT, mid) if momo_move > 0 else slippage_bps(bids_l, "sell", SLIPPAGE_SIZE_USDT, mid)
                                 oi_delta = oi_pct_change_recent(st.oi, OI_DELTA_WINDOW_SEC)
                                 fund_now = cached_latest(st.funding, default=None)
                                 liq_dens = self._liq_density(st, LIQ_DENSITY_SHORT_SEC, LIQ_DENSITY_LONG_SEC, now=now)
@@ -1613,9 +1823,16 @@ class Scanner:
                                     spot_ok=(spot_perp is not None),
                                     cvd_ok=(buy_usdt is not None and sell_usdt is not None),
                                     liq_any=(liq_buy + liq_sell > 0),
+                                    macd_ok=macd_ok,
                                 )
                                 if dq_score < DQ_SCORE_MIN_TRADE:
                                     send_to_tg = False
+                                cvd_delta = (float(buy_usdt) - float(sell_usdt)) if (buy_usdt is not None and sell_usdt is not None) else None
+                                absorption_note = (
+                                    cvd_delta is not None
+                                    and ((momo_move > 0 and cvd_delta < -5000) or (momo_move < 0 and cvd_delta > 5000))
+                                )
+                                extra_lines = ["absorption?"] if absorption_note else []
                                 if send_to_tg:
                                     tg_msg = fmt_tg_alert(
                                         sym, "VERY_HOT " + momo_tag, "LONG" if momo_move > 0 else "SHORT",
@@ -1629,6 +1846,9 @@ class Scanner:
                                         premium=momo_basis, liq_density=liq_dens, spot_perp_ratio=spot_perp,
                                         p24h=p24h, hint=hint if warn else None,
                                         dq_score=dq_score, dq_line=dq_line,
+                                        rsi=rsi, macd_hist=macd_hist, vwap_bias=vwap_bias,
+                                        cvd_delta=cvd_delta, weighted_obi=obi_val, slippage_bps=slippage_bps_val,
+                                        extra_lines=extra_lines,
                                     )
                                     signals.append((rank, tg_msg))
                                     if USE_DEPTH and bid_10k is not None and ask_10k is not None:
