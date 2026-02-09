@@ -1782,7 +1782,11 @@ class Scanner:
                         )
                         print(msg)
                         rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
-                        send_to_tg = not warn
+                        # Раньше мы делали send_to_tg = not warn, но после добавления RSI/MACD/funding/VWAP
+                        # список warn стал слишком «широким» и практически все реальные импульсы фильтровались.
+                        # Сейчас warn влияет только на текст (CHECK: ...), а отправку решают более жёсткие фильтры:
+                        # 5m-тренд, DQ, agg trades ratio и т.п.
+                        send_to_tg = True
                         if send_to_tg and USE_5M_TREND_FILTER:
                             if momo_move > 0 and trend_5m_downtrend(st.price, now):
                                 send_to_tg = False
