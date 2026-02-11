@@ -133,9 +133,9 @@ RECOVERY_LONG_COOLDOWN_SEC = 600     # один RECOVERY_LONG раз в 10 ми�
 FLAT_RANGE_60S_MAX_PCT = 0.12
 USE_AGG_TRADES = True
 AGG_TRADES_LOOKBACK_SEC = 60
-AGG_TRADES_MIN_RATIO = 0.52
+AGG_TRADES_MIN_RATIO = 0.48     # ослаблено (0.52 → 0.48), меньше пропусков
 AGG_TRADES_TTL_SEC = 30.0
-USE_5M_TREND_FILTER = True
+USE_5M_TREND_FILTER = False    # отключено для упрощения (много пропусков)
 CANDLE_5M_SEC = 300
 TREND_5M_BARS = 3
 MOMO_MIN_MOVE_PCT = 2.5       # для “пампа” подними 2.0–4.0
@@ -192,6 +192,15 @@ BASIS_MIN_ABS_PCT = 0.02      # abs(mark-index)/index % threshold to consider fu
 # --- OI delta в алертах (то же окно 60–180с) ---
 OI_DELTA_WINDOW_SEC = 120
 
+# --- OI pre-pump: ранний вход по накоплению (цена в флете, OI растёт) ---
+USE_OI_PRE_PUMP = True
+OI_PRE_PUMP_WINDOW_SEC = 90      # окно для OI delta
+OI_PRE_PUMP_MIN_PCT = 1.0        # OI должен расти минимум на 1%
+OI_PRE_PUMP_VOL_ACCEL = 2.0      # vol accel минимум
+OI_PRE_PUMP_P24H_MIN = -15.0     # p24h не в дампе
+OI_PRE_PUMP_P24H_MAX = 20.0      # p24h ещё не разогрет
+OI_PRE_PUMP_COOLDOWN_SEC = 600   # раз в 10 мин на символ
+
 # --- Liq density: концентрация ликвидаций во времени (short_sec / long_sec) ---
 LIQ_DENSITY_SHORT_SEC = 15.0
 LIQ_DENSITY_LONG_SEC = 60.0
@@ -204,10 +213,10 @@ SPOT_VOL_TTL_SEC = 120.0
 RSI_PERIOD = 14
 RSI_MAX_LONG = 70.0            # MOMO_UP только если RSI < 70 (не перекуплен)
 RSI_MIN_SHORT = 30.0          # MOMO_DOWN только если RSI > 30 (не перепродан)
-USE_RSI_FILTER = True
+USE_RSI_FILTER = False         # только hint, не блокируем (упрощение)
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 MACD_MIN_POINTS = 50          # минимум точек для MACD
-USE_MACD_FILTER = True        # long: MACD line > signal и histogram растёт
+USE_MACD_FILTER = False       # только hint, не блокируем (упрощение)
 VWAP_SESSION_SEC = 900        # VWAP за последние 15 мин (session)
 USE_VWAP_BIAS = True           # price > VWAP = bullish bias в подсказке
 # Funding skew: не лонжить при экстремальном положительном funding и росте
@@ -1519,6 +1528,10 @@ class Scanner:
 
         if tag.startswith("PUMPED_WATCH"):
             return True
+        if tag.startswith("PUMPED_CONTINUE"):
+            return True
+        if tag.startswith("OI_SETUP"):
+            return True
         if tag.startswith("DUMPED_WATCH"):
             return True
         if tag.startswith("RECOVERY_LONG"):
@@ -1609,6 +1622,31 @@ class Scanner:
                         vals_60 = [v for _, v in pts_60]
                         lo_60, hi_60 = min(vals_60), max(vals_60)
                         if lo_60 > 0 and (hi_60 - lo_60) / lo_60 * 100.0 < FLAT_RANGE_60S_MAX_PCT:
+                            # OI pre-pump: цена в флете, но OI растёт = накопление перед выходом (ранний вход)
+                            if USE_OI_PRE_PUMP:
+                                oi_pct_pre = oi_pct_change_recent(st.oi, OI_PRE_PUMP_WINDOW_SEC)
+                                ok_vol_pre, accel_pre, v_now_pre, v_base_pre = volume_acceleration_time(
+                                    st.volume, VOL_SHORT_SEC, VOL_LONG_SEC,
+                                    accel_thresh=OI_PRE_PUMP_VOL_ACCEL, min_now=VOL_MIN_NOW, min_base=VOL_MIN_BASE,
+                                )
+                                p24h_pre = float(getattr(st, "p24h", 0.0))
+                                if (oi_pct_pre >= OI_PRE_PUMP_MIN_PCT and ok_vol_pre and accel_pre >= OI_PRE_PUMP_VOL_ACCEL
+                                    and OI_PRE_PUMP_P24H_MIN <= p24h_pre <= OI_PRE_PUMP_P24H_MAX):
+                                    last_oi_ts = float(getattr(st, "last_oi_setup_ts", 0.0))
+                                    if (now - last_oi_ts) >= OI_PRE_PUMP_COOLDOWN_SEC:
+                                        st.last_oi_setup_ts = now
+                                        range_pct = (hi_60 - lo_60) / lo_60 * 100.0
+                                        msg_oi = (
+                                            f"{sym} OI_SETUP (LONG) | OI+{oi_pct_pre:.2f}%/{OI_PRE_PUMP_WINDOW_SEC}s | "
+                                            f"vol_accel={accel_pre:.2f}x | range={range_pct:.2f}% p24h={p24h_pre:.1f}%"
+                                        )
+                                        print(msg_oi)
+                                        out_oi = fmt_tg_alert(
+                                            sym, "OI_SETUP", "LONG",
+                                            move=oi_pct_pre, window_sec=OI_PRE_PUMP_WINDOW_SEC, vol_accel=accel_pre,
+                                            p24h=p24h_pre, extra_lines=[f"OI+{oi_pct_pre:.2f}% в флете — накопление (препамп)"],
+                                        ) if TG_STRUCTURED else msg_oi
+                                        signals.append((95.0 + min(oi_pct_pre, 10.0), out_oi))
                             continue
 
                     # --- Retrace after long: откат от цены последнего MOMO_UP алерта ---
@@ -1658,18 +1696,29 @@ class Scanner:
                                         out_rc = fmt_tg_alert(sym, "VERY_HOT RECOVERY_LONG", "LONG", move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel, p24h=p24h, extra_lines=["Отскок после дампа"]) if TG_STRUCTURED else msg_rc
                                         signals.append((105.0 + min(momo_move, 15.0), out_rc))
                                         continue
-                                # BULLA-тип: хотя бы один алерт "токен в движении"
+                                # PUMPED: p24h > 25% — токен разогрет. OI+ и движение вверх = continuation (LONG), иначе — watch (шорт?)
                                 if p24h >= PUMPED_WATCH_P24H_MIN:
                                     last_pw = float(getattr(st, "pumped_watch_ts", 0.0))
                                     if (now - last_pw) >= PUMPED_WATCH_COOLDOWN_SEC:
                                         st.pumped_watch_ts = now
-                                        msg_pw = (
-                                            f"{sym} WATCH PUMPED_WATCH | p24h={p24h:.1f}% move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | "
-                                            f"vol_accel={momo_accel:.2f}x — токен разогрет, смотри (шорт?)"
-                                        )
-                                        print(msg_pw)
-                                        out_pw = fmt_tg_alert(sym, "WATCH PUMPED_WATCH", "SHORT", move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel, p24h=p24h, extra_lines=["Токен разогрет, смотри (шорт?)"]) if TG_STRUCTURED else msg_pw
-                                        signals.append((80.0 + min(p24h, 50.0), out_pw))
+                                        oi_delta_pw = oi_pct_change_recent(st.oi, OI_DELTA_WINDOW_SEC)
+                                        # OI растёт + движение вверх = continuation long (STG-тип)
+                                        if oi_delta_pw >= 1.0 and momo_move >= 2.0:
+                                            msg_pc = (
+                                                f"{sym} WATCH PUMPED_CONTINUE (LONG) | p24h={p24h:.1f}% move={momo_move:.2f}% OI+{oi_delta_pw:.2f}% | "
+                                                f"vol_accel={momo_accel:.2f}x — продолжение пампа?"
+                                            )
+                                            print(msg_pc)
+                                            out_pc = fmt_tg_alert(sym, "WATCH PUMPED_CONTINUE", "LONG", move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel, p24h=p24h, extra_lines=[f"OI+{oi_delta_pw:.2f}% — continuation long?"]) if TG_STRUCTURED else msg_pc
+                                            signals.append((92.0 + min(momo_move, 15.0), out_pc))
+                                        else:
+                                            msg_pw = (
+                                                f"{sym} WATCH PUMPED_WATCH | p24h={p24h:.1f}% move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | "
+                                                f"vol_accel={momo_accel:.2f}x — токен разогрет, смотри (шорт?)"
+                                            )
+                                            print(msg_pw)
+                                            out_pw = fmt_tg_alert(sym, "WATCH PUMPED_WATCH", "SHORT", move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel, p24h=p24h, extra_lines=["Токен разогрет, смотри (шорт?)"]) if TG_STRUCTURED else msg_pw
+                                            signals.append((80.0 + min(p24h, 50.0), out_pw))
                                 if p24h <= DUMPED_WATCH_P24H_MAX:
                                     last_dw = float(getattr(st, "dumped_watch_ts", 0.0))
                                     if (now - last_dw) >= DUMPED_WATCH_COOLDOWN_SEC:
@@ -2082,13 +2131,23 @@ class Scanner:
                                     last_pw = float(getattr(st, "pumped_watch_ts", 0.0))
                                     if (now - last_pw) >= PUMPED_WATCH_COOLDOWN_SEC:
                                         st.pumped_watch_ts = now
-                                        msg_pw = (
-                                            f"{sym} WATCH PUMPED_WATCH | p24h={p24h:.1f}% move={momo_move:.2f}% | "
-                                            f"vol_accel={momo_accel:.2f}x — токен разогрет, смотри (шорт?)"
-                                        )
-                                        print(msg_pw)
-                                        out_pw = fmt_tg_alert(sym, "WATCH PUMPED_WATCH", "SHORT", move=momo_move, vol_accel=momo_accel, p24h=p24h, extra_lines=["Токен разогрет, смотри (шорт?)"]) if TG_STRUCTURED else msg_pw
-                                        signals.append((80.0 + min(p24h, 50.0), out_pw))
+                                        oi_delta_pw = oi_pct_change_recent(st.oi, OI_DELTA_WINDOW_SEC)
+                                        if oi_delta_pw >= 1.0 and momo_move >= 2.0:
+                                            msg_pc = (
+                                                f"{sym} WATCH PUMPED_CONTINUE (LONG) | p24h={p24h:.1f}% move={momo_move:.2f}% OI+{oi_delta_pw:.2f}% | "
+                                                f"vol_accel={momo_accel:.2f}x — продолжение пампа?"
+                                            )
+                                            print(msg_pc)
+                                            out_pc = fmt_tg_alert(sym, "WATCH PUMPED_CONTINUE", "LONG", move=momo_move, vol_accel=momo_accel, p24h=p24h, extra_lines=[f"OI+{oi_delta_pw:.2f}% — continuation long?"]) if TG_STRUCTURED else msg_pc
+                                            signals.append((92.0 + min(momo_move, 15.0), out_pc))
+                                        else:
+                                            msg_pw = (
+                                                f"{sym} WATCH PUMPED_WATCH | p24h={p24h:.1f}% move={momo_move:.2f}% | "
+                                                f"vol_accel={momo_accel:.2f}x — токен разогрет, смотри (шорт?)"
+                                            )
+                                            print(msg_pw)
+                                            out_pw = fmt_tg_alert(sym, "WATCH PUMPED_WATCH", "SHORT", move=momo_move, vol_accel=momo_accel, p24h=p24h, extra_lines=["Токен разогрет, смотри (шорт?)"]) if TG_STRUCTURED else msg_pw
+                                            signals.append((80.0 + min(p24h, 50.0), out_pw))
                                 if p24h <= DUMPED_WATCH_P24H_MAX:
                                     last_dw = float(getattr(st, "dumped_watch_ts", 0.0))
                                     if (now - last_dw) >= DUMPED_WATCH_COOLDOWN_SEC:
