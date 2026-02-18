@@ -177,8 +177,8 @@ DEPTH_MIN_LEVEL_USDT = 10_000.0   # только уровни от 10k USDT
 DEPTH_TTL_SEC = 15.0
 BOOK_UPDATE_COOLDOWN_SEC = 300      # повтор "стакан обновился" не чаще раз в 5 мин
 BOOK_UPDATE_MIN_CHANGE_PCT = 50.0   # слать повтор если bid_10k или ask_10k изменились на 50%+
-BOOK_UPDATE_MAX_AGE_SEC = 900       # слать BOOK_UPDATE только пока базовый алерт свежий (например, 15 минут)
-USE_BOOK_UPDATE = True              # слать BOOK_UPDATE когда стакан сильно изменился после TG-алерта
+BOOK_UPDATE_MAX_AGE_SEC = 300       # только 5 мин после алерта (не спамить старыми)
+USE_BOOK_UPDATE = False             # отключено: букмап спамил даже когда сигнал был давно
 
 # --- Optional extra confirm signals ---
 USE_TAKER_RATIO = True
@@ -200,6 +200,13 @@ OI_PRE_PUMP_VOL_ACCEL = 2.0      # vol accel минимум
 OI_PRE_PUMP_P24H_MIN = -15.0     # p24h не в дампе
 OI_PRE_PUMP_P24H_MAX = 20.0      # p24h ещё не разогрет
 OI_PRE_PUMP_COOLDOWN_SEC = 600   # раз в 10 мин на символ
+
+# --- OI + Funding + Fair (RPL-логика: OI растёт + funding отрицательный + premium) ---
+USE_OI_FUNDING_FAIR = True
+OI_FF_OI_MIN_PCT = 1.0            # OI растёт минимум на 1%
+OI_FF_FUNDING_MAX = -0.0005       # funding < -0.05% (шорты платят, лонги фармят)
+OI_FF_BASIS_MIN_PCT = 0.01        # premium (mark>index) минимум 0.01%
+OI_FF_COOLDOWN_SEC = 900          # раз в 15 мин на символ
 
 # --- Liq density: концентрация ликвидаций во времени (short_sec / long_sec) ---
 LIQ_DENSITY_SHORT_SEC = 15.0
@@ -1532,6 +1539,8 @@ class Scanner:
             return True
         if tag.startswith("OI_SETUP"):
             return True
+        if tag.startswith("OI_FUNDING_FAIR"):
+            return True
         if tag.startswith("DUMPED_WATCH"):
             return True
         if tag.startswith("RECOVERY_LONG"):
@@ -1616,6 +1625,31 @@ class Scanner:
                         self.stats.few_prices += 1
                         continue
 
+                    # --- OI + Funding + Fair (RPL-логика: OI растёт + funding отрицательный + premium) ---
+                    if USE_OI_FUNDING_FAIR:
+                        oi_pct_ff = oi_pct_change_recent(st.oi, OI_DELTA_WINDOW_SEC)
+                        fund_now_ff = cached_latest(st.funding, default=None)
+                        basis_ff = await self._get_basis_pct(http, sym) if USE_BASIS else 0.0
+                        if (oi_pct_ff >= OI_FF_OI_MIN_PCT
+                            and fund_now_ff is not None and float(fund_now_ff) < OI_FF_FUNDING_MAX
+                            and basis_ff > OI_FF_BASIS_MIN_PCT):
+                            last_ff = float(getattr(st, "last_oi_ff_ts", 0.0))
+                            if (now - last_ff) >= OI_FF_COOLDOWN_SEC:
+                                st.last_oi_ff_ts = now
+                                fund_pct = float(fund_now_ff) * 100.0
+                                msg_ff = (
+                                    f"{sym} OI_FUNDING_FAIR (LONG) | OI+{oi_pct_ff:.2f}% | "
+                                    f"funding={fund_pct:.4f}% | premium={basis_ff:+.3f}%"
+                                )
+                                print(msg_ff)
+                                out_ff = fmt_tg_alert(
+                                    sym, "OI_FUNDING_FAIR", "LONG",
+                                    move=oi_pct_ff, window_sec=OI_DELTA_WINDOW_SEC,
+                                    funding=float(fund_now_ff), premium=basis_ff,
+                                    extra_lines=["OI+ · funding neg (фарм) · premium — лонг"],
+                                ) if TG_STRUCTURED else msg_ff
+                                signals.append((98.0 + min(oi_pct_ff, 8.0), out_ff))
+
                     # Цена не плоская: не слать MOMO если за 60с почти не двигалась
                     pts_60 = ring_window_prices(st.price, 60.0, now)
                     if len(pts_60) >= 5:
@@ -1623,7 +1657,10 @@ class Scanner:
                         lo_60, hi_60 = min(vals_60), max(vals_60)
                         if lo_60 > 0 and (hi_60 - lo_60) / lo_60 * 100.0 < FLAT_RANGE_60S_MAX_PCT:
                             # OI pre-pump: цена в флете, но OI растёт = накопление перед выходом (ранний вход)
-                            if USE_OI_PRE_PUMP:
+                            # Не дублировать OI_SETUP если только что отправили OI_FUNDING_FAIR
+                            if (now - getattr(st, "last_oi_ff_ts", 0)) < 2:
+                                pass  # skip OI_SETUP, OI_FUNDING_FAIR уже отправили
+                            elif USE_OI_PRE_PUMP:
                                 oi_pct_pre = oi_pct_change_recent(st.oi, OI_PRE_PUMP_WINDOW_SEC)
                                 ok_vol_pre, accel_pre, v_now_pre, v_base_pre = volume_acceleration_time(
                                     st.volume, VOL_SHORT_SEC, VOL_LONG_SEC,
