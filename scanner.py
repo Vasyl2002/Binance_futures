@@ -12,6 +12,7 @@ from state import STATES  # sym -> TickerState
 from price_signal import price_compression
 from volume_signal import volume_acceleration_time
 from spike_signal import spike_detector
+from binance_rest import get_open_interest_hist, get_klines
 
 
 # ================== TUNING ==================
@@ -200,6 +201,20 @@ OI_PRE_PUMP_VOL_ACCEL = 2.0      # vol accel минимум
 OI_PRE_PUMP_P24H_MIN = -15.0     # p24h не в дампе
 OI_PRE_PUMP_P24H_MAX = 20.0      # p24h ещё не разогрет
 OI_PRE_PUMP_COOLDOWN_SEC = 600   # раз в 10 мин на символ
+
+# --- ACCUM: pre-announcement accumulation (OI растёт, цена в флете — накопление до новости) ---
+USE_ACCUM_ALERT = True
+ACCUM_OI_PERIOD = "15m"
+ACCUM_OI_BARS = 30           # 30 x 15m = 7.5h истории
+ACCUM_OI_MIN_PCT_4H = 3.0    # OI должен расти минимум 3% за 4h (16 баров)
+ACCUM_MAX_RANGE_PCT_4H = 2.2  # цена в диапазоне < 2.2% за 4h
+ACCUM_P24H_MIN = -15.0       # p24h не в дампе
+ACCUM_P24H_MAX = 25.0        # p24h ещё не разогрет
+ACCUM_COOLDOWN_NORMAL_SEC = 1800   # 15 мин при обычной аномалии
+ACCUM_COOLDOWN_STRONG_SEC = 300   # 5 мин при сильной (OI+ >= 6%)
+ACCUM_STRONG_THRESH_PCT = 6.0     # OI growth >= 6% = сильная аномалия → чаще алерты
+ACCUM_INTERVAL_SEC = 300     # проверка раз в 5 мин
+ACCUM_MIN_Q24H = 3_000_000.0     # минимум ликвидности
 
 # --- OI + Funding + Fair (RPL-логика: OI растёт + funding отрицательный + premium) ---
 USE_OI_FUNDING_FAIR = True
@@ -1033,6 +1048,7 @@ class Scanner:
         # Liquidation WS
         self.enable_liq_ws = bool(enable_liq_ws)
         self._liq_task: Optional[asyncio.Task] = None
+        self._accum_task: Optional[asyncio.Task] = None
 
         # Caches (REST)
         self._taker_cache: Dict[str, Tuple[float, float]] = {}
@@ -1270,6 +1286,104 @@ class Scanner:
 
             await asyncio.sleep(backoff)
             backoff = min(backoff * 1.7, 20.0)
+
+    async def _accumulation_loop(self):
+        """ACCUM: pre-announcement accumulation (OI растёт, цена в флете). Отдельный алерт, без индикаторов."""
+        if not USE_ACCUM_ALERT:
+            return
+        await asyncio.sleep(ACCUM_INTERVAL_SEC)  # первый запуск через 5 мин
+        bars_4h = 16  # 16 x 15m = 4h
+        while True:
+            try:
+                await asyncio.sleep(ACCUM_INTERVAL_SEC)
+                now = time.time()
+                symbols = list(STATES.keys())
+                if self.allowed is not None:
+                    symbols = [s for s in symbols if s in self.allowed]
+                symbols = [s for s in symbols if s.endswith("USDT") and s not in BLOCKLIST and s not in STABLE_LIKE]
+                if not symbols:
+                    continue
+
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as http:
+                    for sym in symbols[:80]:  # лимит на итерацию
+                        st = STATES.get(sym)
+                        if st is None:
+                            continue
+                        q24h = float(getattr(st, "q24h", 0.0) or 0.0)
+                        if q24h < ACCUM_MIN_Q24H:
+                            continue
+                        p24h = float(getattr(st, "p24h", 0.0))
+                        if not (ACCUM_P24H_MIN <= p24h <= ACCUM_P24H_MAX):
+                            continue
+
+                        last_ts = float(getattr(st, "last_accum_alert_ts", 0.0))
+                        last_score = float(getattr(st, "last_accum_score", 0.0))
+                        is_strong = last_score >= ACCUM_STRONG_THRESH_PCT
+                        cd = ACCUM_COOLDOWN_STRONG_SEC if is_strong else ACCUM_COOLDOWN_NORMAL_SEC
+                        if now - last_ts < cd:
+                            continue
+
+                        result = await self._check_accumulation(http, sym)
+                        if result is None:
+                            continue
+                        oi_pct, range_pct, score = result
+
+                        st.last_accum_alert_ts = now
+                        st.last_accum_score = score
+
+                        msg = (
+                            f"{sym} ACCUM (LONG) | OI+{oi_pct:.2f}% 4h | range {range_pct:.2f}% | p24h {p24h:.1f}%"
+                        )
+                        print(msg)
+                        if TG_STRUCTURED:
+                            tg_msg = fmt_tg_alert(
+                                sym, "ACCUM", "LONG",
+                                move=oi_pct,
+                                extra_lines=[f"OI+{oi_pct:.2f}% 4h · range {range_pct:.2f}% · p24h {p24h:.1f}% · накопление до анонса"],
+                            )
+                        else:
+                            tg_msg = msg
+                        if self.tg_enabled and self.tg_rl.allow():
+                            try:
+                                await _tg_send(http, self.tg_token, self.tg_chat_id, tg_msg)
+                            except Exception:
+                                pass
+            except Exception as e:
+                print(f"[ACCUM] error: {e!r}")
+
+    async def _check_accumulation(self, http: aiohttp.ClientSession, sym: str) -> Optional[Tuple[float, float, float]]:
+        """Returns (oi_pct_4h, range_pct_4h, score) or None."""
+        if not USE_ACCUM_ALERT:
+            return None
+        bars_4h = 16
+        oi_data = await get_open_interest_hist(http, sym, period=ACCUM_OI_PERIOD, limit=ACCUM_OI_BARS)
+        klines_data = await get_klines(http, sym, interval=ACCUM_OI_PERIOD, limit=ACCUM_OI_BARS)
+        if not oi_data or len(oi_data) < bars_4h:
+            return None
+        if not klines_data or len(klines_data) < bars_4h:
+            return None
+
+        oi_old = float(oi_data[-bars_4h]["sumOpenInterest"])
+        oi_new = float(oi_data[-1]["sumOpenInterest"])
+        if oi_old <= 0:
+            return None
+        oi_pct = (oi_new - oi_old) / oi_old * 100.0
+        if oi_pct < ACCUM_OI_MIN_PCT_4H:
+            return None
+
+        lows = [float(k[3]) for k in klines_data[-bars_4h:]]
+        highs = [float(k[2]) for k in klines_data[-bars_4h:]]
+        if not lows or not highs:
+            return None
+        lo, hi = min(lows), max(highs)
+        if lo <= 0:
+            return None
+        range_pct = (hi - lo) / lo * 100.0
+        if range_pct > ACCUM_MAX_RANGE_PCT_4H:
+            return None
+
+        score = oi_pct
+        return (oi_pct, range_pct, score)
 
     # ---------- REST helpers (cached) ----------
     async def _get_taker_ratio(self, session: aiohttp.ClientSession, sym: str) -> float:
@@ -1585,6 +1699,8 @@ class Scanner:
 
         if self.enable_liq_ws and self._liq_task is None:
             self._liq_task = asyncio.create_task(self._liq_ws_loop())
+        if USE_ACCUM_ALERT and self._accum_task is None:
+            self._accum_task = asyncio.create_task(self._accumulation_loop())
 
         async with aiohttp.ClientSession() as http:
             if self.tg_enabled:
