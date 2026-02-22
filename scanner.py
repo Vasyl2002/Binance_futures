@@ -101,8 +101,8 @@ MOMO_VOL_ACCEL_THRESH = 6.0
 MOMO_VOL_MIN_NOW = 500.0         # это “плотность” объёма, подстрой под себя
 MOMO_VOL_MIN_BASE = 10.0
 
-MOMO_TAKER_LONG_MIN = 1.10
-MOMO_TAKER_SHORT_MAX = 0.90
+MOMO_TAKER_LONG_MIN = 1.50       # Grok: 1.13 = neutral, нужен 1.5+ для momentum
+MOMO_TAKER_SHORT_MAX = 0.67      # 1/1.5 — симметрично
 
 MOMO_LIQ_WINDOW_SEC = 30
 MOMO_COOLDOWN_SEC = 120
@@ -216,11 +216,17 @@ LIQ_DENSITY_LONG_SEC = 60.0
 USE_SPOT_PERP_VOL = True
 SPOT_VOL_TTL_SEC = 120.0
 
-# --- RSI / MACD / VWAP (фильтры перекупленности и подтверждение momentum) ---
+# --- RSI / MACD / VWAP (Grok: hard filter + exhaustion) ---
 RSI_PERIOD = 14
-RSI_MAX_LONG = 70.0            # MOMO_UP только если RSI < 70 (не перекуплен)
-RSI_MIN_SHORT = 30.0          # MOMO_DOWN только если RSI > 30 (не перепродан)
-USE_RSI_FILTER = False         # только hint, не блокируем (упрощение)
+RSI_MAX_LONG = 75.0            # long только если RSI < 75
+RSI_MIN_SHORT = 25.0           # short только если RSI > 25 (не в oversold)
+RSI_EXHAUST_BLOCK_LONG = 80.0   # RSI > 80 → block long (exhaustion)
+RSI_EXHAUST_BLOCK_SHORT = 20.0  # RSI < 20 → block short (oversold trap)
+USE_RSI_FILTER = True
+# Book imbalance (Grok: imb directional)
+MOMO_IMB_LONG_MIN = 0.10       # long: imb > 0.1 (bid heavy)
+MOMO_IMB_SHORT_MAX = -0.10     # short: imb < -0.1 (ask heavy)
+MOMO_IMB_LONG_BLOCK = -0.30    # imb < -0.3 → no long (ask heavy = red flag)
 MACD_FAST, MACD_SLOW, MACD_SIGNAL = 12, 26, 9
 MACD_MIN_POINTS = 50          # минимум точек для MACD
 USE_MACD_FILTER = False       # только hint, не блокируем (упрощение)
@@ -240,9 +246,10 @@ USE_WEIGHTED_OBI = True
 USE_SLIPPAGE_IN_ALERT = False # опционально в алерте
 
 # --- Data quality (DQ): не торговать при плохих данных ---
-DQ_SCORE_MIN_TRADE = 70        # ниже — только WATCH / не слать VERY_HOT в TG
+DQ_SCORE_MIN_TRADE = 80        # Grok: 70 → 80, меньше traps
 MIN_BOOK_DEPTH_USDT = 8_000.0  # стакан "тонкий": bid_10k+ask_10k ниже — book N/A, не считать как вход
 OI_WINDOW_MIN_POINTS = 4       # минимум точек OI в окне для dq_oi_ok
+OI_MIN_POINTS_MOMO = 6          # VERY_HOT MOMO: требуем минимум 6 точек OI (иначе OI не мониторится)
 DQ_MACD_BONUS = 10            # +10 к DQ если MACD подтверждает направление (макс 100)
 
 # --- Alerts & Telegram batching ---
@@ -1868,11 +1875,25 @@ class Scanner:
                         )
                         print(msg)
                         rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
-                        # Раньше мы делали send_to_tg = not warn, но после добавления RSI/MACD/funding/VWAP
-                        # список warn стал слишком «широким» и практически все реальные импульсы фильтровались.
-                        # Сейчас warn влияет только на текст (CHECK: ...), а отправку решают более жёсткие фильтры:
-                        # 5m-тренд, DQ, agg trades ratio и т.п.
                         send_to_tg = True
+                        # --- Grok: strict momentum gates (exhaustion / strength) ---
+                        if send_to_tg and rsi is not None:
+                            if momo_move > 0 and (rsi >= RSI_EXHAUST_BLOCK_LONG or rsi >= RSI_MAX_LONG):
+                                send_to_tg = False
+                            if momo_move < 0 and (rsi <= RSI_EXHAUST_BLOCK_SHORT or rsi <= RSI_MIN_SHORT):
+                                send_to_tg = False
+                        if send_to_tg:
+                            if momo_move > 0 and momo_taker < MOMO_TAKER_LONG_MIN:
+                                send_to_tg = False
+                            if momo_move < 0 and momo_taker > MOMO_TAKER_SHORT_MAX:
+                                send_to_tg = False
+                        if send_to_tg and depth_imb is not None:
+                            if momo_move > 0 and (depth_imb < MOMO_IMB_LONG_BLOCK or depth_imb < MOMO_IMB_LONG_MIN):
+                                send_to_tg = False
+                            if momo_move < 0 and depth_imb > MOMO_IMB_SHORT_MAX:
+                                send_to_tg = False
+                        if send_to_tg and (depth_total is None or depth_total < MIN_BOOK_DEPTH_USDT):
+                            send_to_tg = False
                         if send_to_tg and USE_5M_TREND_FILTER:
                             if momo_move > 0 and trend_5m_downtrend(st.price, now):
                                 send_to_tg = False
@@ -1916,6 +1937,8 @@ class Scanner:
                                     macd_ok=macd_ok,
                                 )
                                 if dq_score < DQ_SCORE_MIN_TRADE:
+                                    send_to_tg = False
+                                if send_to_tg and len(oi_win) < OI_MIN_POINTS_MOMO:
                                     send_to_tg = False
                                 cvd_delta = (float(buy_usdt) - float(sell_usdt)) if (buy_usdt is not None and sell_usdt is not None) else None
                                 absorption_note = (
