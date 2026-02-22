@@ -29,6 +29,10 @@ class TickerState:
         self.last_alert_level = "IGNORE"
         self.last_alert_score = 0.0
 
+        # ACCUM (pre-announcement accumulation) — отдельный кулдаун
+        self.last_accum_alert_ts = 0.0
+        self.last_accum_score = 0.0
+
         self.funding = Ring(200)  # funding rate history
 
         # внутри TickerState
