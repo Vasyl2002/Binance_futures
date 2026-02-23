@@ -1304,6 +1304,7 @@ class Scanner:
                 if not symbols:
                     continue
 
+                checked = 0
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as http:
                     for sym in symbols[:80]:  # лимит на итерацию
                         st = STATES.get(sym)
@@ -1324,6 +1325,7 @@ class Scanner:
                             continue
 
                         result = await self._check_accumulation(http, sym)
+                        checked += 1
                         if result is None:
                             continue
                         oi_pct, range_pct, score = result
@@ -1348,6 +1350,7 @@ class Scanner:
                                 await _tg_send(http, self.tg_token, self.tg_chat_id, tg_msg)
                             except Exception:
                                 pass
+                print(f"[ACCUM] scan done, checked={checked} syms")
             except Exception as e:
                 print(f"[ACCUM] error: {e!r}")
 
@@ -2706,4 +2709,3 @@ class Scanner:
                                 await _tg_send(http, self.tg_token, self.tg_chat_id, msg)
                             except Exception:
                                 pass
-
