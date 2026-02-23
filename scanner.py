@@ -12,7 +12,7 @@ from state import STATES  # sym -> TickerState
 from price_signal import price_compression
 from volume_signal import volume_acceleration_time
 from spike_signal import spike_detector
-from binance_rest import get_open_interest_hist, get_klines
+from binance_rest import get_open_interest_hist, get_klines, get_top_long_short_ratio, get_funding
 
 
 # ================== TUNING ==================
@@ -207,7 +207,10 @@ USE_ACCUM_ALERT = True
 ACCUM_OI_PERIOD = "15m"
 ACCUM_OI_BARS = 30           # 30 x 15m = 7.5h истории
 ACCUM_OI_MIN_PCT_4H = 3.0    # OI должен расти минимум 3% за 4h (16 баров)
-ACCUM_MAX_RANGE_PCT_4H = 2.2  # цена в диапазоне < 2.2% за 4h
+ACCUM_MAX_RANGE_PCT_4H = 2.2  # цена в диапазоне < 2.2% за 4h (флет)
+ACCUM_MAX_RANGE_PULLBACK_PCT = 4.0  # при p24h < 0 (откат) — разрешить range до 4%
+ACCUM_LONG_RATIO_MIN = 1.15  # Top Trader L/S > 1.15 (53%+ longs) → ослабить OI порог до 2.5%
+ACCUM_OI_MIN_WHEN_LONGS_PCT = 2.5  # при longs > 53%
 ACCUM_P24H_MIN = -15.0       # p24h не в дампе
 ACCUM_P24H_MAX = 25.0        # p24h ещё не разогрет
 ACCUM_COOLDOWN_NORMAL_SEC = 900   # 15 мин при обычной аномалии
@@ -215,6 +218,17 @@ ACCUM_COOLDOWN_STRONG_SEC = 300   # 5 мин при сильной (OI+ >= 6%)
 ACCUM_STRONG_THRESH_PCT = 6.0     # OI growth >= 6% = сильная аномалия → чаще алерты
 ACCUM_INTERVAL_SEC = 300     # проверка раз в 5 мин
 ACCUM_MIN_Q24H = 3_000_000.0     # минимум ликвидности
+
+# --- LS_CALL: Long/Short calls по Top Trader L/S ratio (без OI) ---
+USE_LS_CALL_ALERT = True
+LS_CALL_LONG_RATIO_MIN = 1.20   # L/S > 1.2 = 55%+ longs → LONG_CALL
+LS_CALL_SHORT_RATIO_MAX = 0.85  # L/S < 0.85 = 55%+ shorts → SHORT_CALL
+LS_CALL_P24H_MAX_LONG = 20.0    # long: p24h < 20% (не в пампе)
+LS_CALL_P24H_MIN_SHORT = -20.0  # short: p24h > -20% (не в дампе)
+LS_CALL_FUNDING_FILTER = True    # не коллить long при funding > 0.1%, short при funding < -0.1%
+LS_CALL_COOLDOWN_SEC = 600      # 10 мин на символ
+LS_CALL_INTERVAL_SEC = 300      # проверка раз в 5 мин
+LS_CALL_MIN_Q24H = 3_000_000.0
 
 # --- OI + Funding + Fair (RPL-логика: OI растёт + funding отрицательный + premium) ---
 USE_OI_FUNDING_FAIR = True
@@ -1049,6 +1063,7 @@ class Scanner:
         self.enable_liq_ws = bool(enable_liq_ws)
         self._liq_task: Optional[asyncio.Task] = None
         self._accum_task: Optional[asyncio.Task] = None
+        self._ls_call_task: Optional[asyncio.Task] = None
 
         # Caches (REST)
         self._taker_cache: Dict[str, Tuple[float, float]] = {}
@@ -1301,6 +1316,11 @@ class Scanner:
                 if self.allowed is not None:
                     symbols = [s for s in symbols if s in self.allowed]
                 symbols = [s for s in symbols if s.endswith("USDT") and s not in BLOCKLIST and s not in STABLE_LIKE]
+                # сортируем по q24h — сначала ликвидные (STRK и т.п. не пропустим)
+                def _q24h(s):
+                    st = STATES.get(s)
+                    return float(getattr(st, "q24h", 0) or 0) if st else 0.0
+                symbols = sorted(symbols, key=_q24h, reverse=True)
                 if not symbols:
                     continue
 
@@ -1324,24 +1344,25 @@ class Scanner:
                         if now - last_ts < cd:
                             continue
 
-                        result = await self._check_accumulation(http, sym)
+                        result = await self._check_accumulation(http, sym, p24h=p24h)
                         checked += 1
                         if result is None:
                             continue
-                        oi_pct, range_pct, score = result
+                        oi_pct, range_pct, score, ls_ratio = result
 
                         st.last_accum_alert_ts = now
                         st.last_accum_score = score
 
+                        ls_str = f" L/S {ls_ratio:.2f}" if ls_ratio is not None else ""
                         msg = (
-                            f"{sym} ACCUM (LONG) | OI+{oi_pct:.2f}% 4h | range {range_pct:.2f}% | p24h {p24h:.1f}%"
+                            f"{sym} ACCUM (LONG) | OI+{oi_pct:.2f}% 4h | range {range_pct:.2f}% | p24h {p24h:.1f}%{ls_str}"
                         )
                         print(msg)
                         if TG_STRUCTURED:
                             tg_msg = fmt_tg_alert(
                                 sym, "ACCUM", "LONG",
                                 move=oi_pct,
-                                extra_lines=[f"OI+{oi_pct:.2f}% 4h · range {range_pct:.2f}% · p24h {p24h:.1f}% · накопление до анонса"],
+                                extra_lines=[f"OI+{oi_pct:.2f}% 4h · range {range_pct:.2f}% · p24h {p24h:.1f}%{f' · L/S {ls_ratio:.2f}' if ls_ratio is not None else ''} · накопление до анонса"],
                             )
                         else:
                             tg_msg = msg
@@ -1354,7 +1375,102 @@ class Scanner:
             except Exception as e:
                 print(f"[ACCUM] error: {e!r}")
 
-    async def _check_accumulation(self, http: aiohttp.ClientSession, sym: str) -> Optional[Tuple[float, float, float]]:
+    async def _ls_call_loop(self):
+        """LS_CALL: Long/Short по Top Trader L/S ratio (без OI). Отдельный алерт."""
+        if not USE_LS_CALL_ALERT:
+            return
+        await asyncio.sleep(LS_CALL_INTERVAL_SEC)
+        while True:
+            try:
+                await asyncio.sleep(LS_CALL_INTERVAL_SEC)
+                now = time.time()
+                symbols = list(STATES.keys())
+                if self.allowed is not None:
+                    symbols = [s for s in symbols if s in self.allowed]
+                symbols = [s for s in symbols if s.endswith("USDT") and s not in BLOCKLIST and s not in STABLE_LIKE]
+                def _q24h(s):
+                    st = STATES.get(s)
+                    return float(getattr(st, "q24h", 0) or 0) if st else 0.0
+                symbols = sorted(symbols, key=_q24h, reverse=True)
+                if not symbols:
+                    continue
+
+                checked = 0
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as http:
+                    for sym in symbols[:80]:
+                        st = STATES.get(sym)
+                        if st is None:
+                            continue
+                        q24h = float(getattr(st, "q24h", 0.0) or 0.0)
+                        if q24h < LS_CALL_MIN_Q24H:
+                            continue
+                        p24h = float(getattr(st, "p24h", 0.0))
+
+                        last_ts = float(getattr(st, "last_ls_call_ts", 0.0))
+                        if now - last_ts < LS_CALL_COOLDOWN_SEC:
+                            continue
+
+                        result = await self._check_ls_call(http, sym, p24h)
+                        checked += 1
+                        if result is None:
+                            continue
+                        side, ratio, funding_pct = result
+
+                        st.last_ls_call_ts = now
+                        st.last_ls_call_side = side
+
+                        fund_str = f" fund={funding_pct*100:.4f}%" if funding_pct is not None else ""
+                        msg = f"{sym} LS_CALL ({side}) | L/S {ratio:.2f} | p24h {p24h:.1f}%{fund_str}"
+                        print(msg)
+                        if TG_STRUCTURED:
+                            extra = [f"L/S {ratio:.2f} · p24h {p24h:.1f}%"]
+                            if funding_pct is not None:
+                                extra.append(f"funding {funding_pct*100:.4f}%")
+                            extra.append("колл по позициям топ-трейдеров (без OI)" if side == "LONG" else "колл по шортам топ-трейдеров (без OI)")
+                            tg_msg = fmt_tg_alert(sym, f"LS_CALL_{side}", side, extra_lines=extra)
+                        else:
+                            tg_msg = msg
+                        if self.tg_enabled and self.tg_rl.allow():
+                            try:
+                                await _tg_send(http, self.tg_token, self.tg_chat_id, tg_msg)
+                            except Exception:
+                                pass
+                print(f"[LS_CALL] scan done, checked={checked} syms")
+            except Exception as e:
+                print(f"[LS_CALL] error: {e!r}")
+
+    async def _check_ls_call(
+        self, http: aiohttp.ClientSession, sym: str, p24h: float
+    ) -> Optional[Tuple[str, float, Optional[float]]]:
+        """Returns (side, ratio, funding_pct) or None. side = LONG | SHORT."""
+        if not USE_LS_CALL_ALERT:
+            return None
+        try:
+            ratio = await get_top_long_short_ratio(http, sym, period="5m", limit=2)
+        except Exception:
+            return None
+        if ratio is None:
+            return None
+
+        funding_pct = None
+        try:
+            funding_pct = await get_funding(http, sym)
+        except Exception:
+            pass
+
+        if ratio >= LS_CALL_LONG_RATIO_MIN and p24h < LS_CALL_P24H_MAX_LONG:
+            if LS_CALL_FUNDING_FILTER and funding_pct is not None and funding_pct > 0.001:
+                return None  # funding > 0.1% — лонги платят, не коллить long
+            return ("LONG", ratio, funding_pct)
+        if ratio <= LS_CALL_SHORT_RATIO_MAX and p24h > LS_CALL_P24H_MIN_SHORT:
+            if LS_CALL_FUNDING_FILTER and funding_pct is not None and funding_pct < -0.001:
+                return None  # funding < -0.1% — шорты платят, не коллить short
+            return ("SHORT", ratio, funding_pct)
+        return None
+
+    async def _check_accumulation(
+        self, http: aiohttp.ClientSession, sym: str, p24h: float = 0.0
+    ) -> Optional[Tuple[float, float, float, Optional[float]]]:
         """Returns (oi_pct_4h, range_pct_4h, score) or None."""
         if not USE_ACCUM_ALERT:
             return None
@@ -1371,7 +1487,13 @@ class Scanner:
         if oi_old <= 0:
             return None
         oi_pct = (oi_new - oi_old) / oi_old * 100.0
-        if oi_pct < ACCUM_OI_MIN_PCT_4H:
+        ls_ratio = None
+        try:
+            ls_ratio = await get_top_long_short_ratio(http, sym, period="5m", limit=2)
+        except Exception:
+            pass
+        oi_min = ACCUM_OI_MIN_WHEN_LONGS_PCT if (ls_ratio is not None and ls_ratio >= ACCUM_LONG_RATIO_MIN) else ACCUM_OI_MIN_PCT_4H
+        if oi_pct < oi_min:
             return None
 
         lows = [float(k[3]) for k in klines_data[-bars_4h:]]
@@ -1382,11 +1504,12 @@ class Scanner:
         if lo <= 0:
             return None
         range_pct = (hi - lo) / lo * 100.0
-        if range_pct > ACCUM_MAX_RANGE_PCT_4H:
+        max_range = ACCUM_MAX_RANGE_PULLBACK_PCT if p24h < 0 else ACCUM_MAX_RANGE_PCT_4H
+        if range_pct > max_range:
             return None
 
         score = oi_pct
-        return (oi_pct, range_pct, score)
+        return (oi_pct, range_pct, score, ls_ratio)
 
     # ---------- REST helpers (cached) ----------
     async def _get_taker_ratio(self, session: aiohttp.ClientSession, sym: str) -> float:
@@ -1704,6 +1827,8 @@ class Scanner:
             self._liq_task = asyncio.create_task(self._liq_ws_loop())
         if USE_ACCUM_ALERT and self._accum_task is None:
             self._accum_task = asyncio.create_task(self._accumulation_loop())
+        if USE_LS_CALL_ALERT and self._ls_call_task is None:
+            self._ls_call_task = asyncio.create_task(self._ls_call_loop())
 
         async with aiohttp.ClientSession() as http:
             if self.tg_enabled:
