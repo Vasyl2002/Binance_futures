@@ -40,6 +40,26 @@ async def get_klines(
         return data
 
 
+async def get_top_long_short_ratio(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    period: str = "5m",
+    limit: int = 2,
+) -> Optional[float]:
+    """Top Trader Long/Short Ratio (by positions). Returns ratio or None. >1 = more longs."""
+    url = f"{BASE}/futures/data/topLongShortPositionRatio"
+    params = {"symbol": symbol, "period": period, "limit": limit}
+    async with session.get(url, params=params, timeout=10) as r:
+        if r.status != 200:
+            return None
+        data = await r.json()
+        if not isinstance(data, list) or not data:
+            return None
+        last = data[-1]
+        ratio = last.get("longShortRatio")
+        return float(ratio) if ratio is not None else None
+
+
 async def get_open_interest(session: aiohttp.ClientSession, symbol: str) -> float:
     url = f"{BASE}/fapi/v1/openInterest"
     async with session.get(url, params={"symbol": symbol}) as r:
