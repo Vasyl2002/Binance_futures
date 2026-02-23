@@ -210,7 +210,7 @@ ACCUM_OI_MIN_PCT_4H = 3.0    # OI должен расти минимум 3% за
 ACCUM_MAX_RANGE_PCT_4H = 2.2  # цена в диапазоне < 2.2% за 4h
 ACCUM_P24H_MIN = -15.0       # p24h не в дампе
 ACCUM_P24H_MAX = 25.0        # p24h ещё не разогрет
-ACCUM_COOLDOWN_NORMAL_SEC = 1800   # 15 мин при обычной аномалии
+ACCUM_COOLDOWN_NORMAL_SEC = 900   # 15 мин при обычной аномалии
 ACCUM_COOLDOWN_STRONG_SEC = 300   # 5 мин при сильной (OI+ >= 6%)
 ACCUM_STRONG_THRESH_PCT = 6.0     # OI growth >= 6% = сильная аномалия → чаще алерты
 ACCUM_INTERVAL_SEC = 300     # проверка раз в 5 мин
@@ -2706,3 +2706,4 @@ class Scanner:
                                 await _tg_send(http, self.tg_token, self.tg_chat_id, msg)
                             except Exception:
                                 pass
+
