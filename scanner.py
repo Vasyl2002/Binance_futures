@@ -120,7 +120,8 @@ MOMO_STRONG_MOVE_PCT = 4.0       # |move| >= это = "сильный" импу�
 MOMO_STRONG_CONFIRM_MIN_PCT = 0.0   # для сильного: в последние 20s достаточно "не развернулись" (c_move <= 0 для DOWN)
 MOMO_STRONG_BOUNCE_MAX_PCT = 0.6   # для сильного дампа: разрешить отскок от дна до 0.6% (иначе 0.35%)
 
-PUMPED_WATCH_P24H_MIN = 25.0
+PUMPED_WATCH_P24H_MIN = 25.0   # зона "разогрет"
+PUMPED_EARLY_MAX_P24H = 40.0   # p24h 25-40% = ранний памп, continuation (LONG). >40% = PUMPED_WATCH (SHORT)
 PUMPED_WATCH_COOLDOWN_SEC = 7200
 DUMPED_WATCH_P24H_MAX = -50.0   # p24h ниже = "в дампе", раз в кулдаун слать WATCH (MM возит вверх-вниз)
 DUMPED_WATCH_COOLDOWN_SEC = 7200
@@ -213,11 +214,14 @@ ACCUM_LONG_RATIO_MIN = 1.15  # Top Trader L/S > 1.15 (53%+ longs) → ослаб
 ACCUM_OI_MIN_WHEN_LONGS_PCT = 2.5  # при longs > 53%
 ACCUM_P24H_MIN = -15.0       # p24h не в дампе
 ACCUM_P24H_MAX = 25.0        # p24h ещё не разогрет
-ACCUM_COOLDOWN_NORMAL_SEC = 900   # 15 мин при обычной аномалии
-ACCUM_COOLDOWN_STRONG_SEC = 300   # 5 мин при сильной (OI+ >= 6%)
-ACCUM_STRONG_THRESH_PCT = 6.0     # OI growth >= 6% = сильная аномалия → чаще алерты
+ACCUM_COOLDOWN_NORMAL_SEC = 1800   # 30 мин при обычной аномалии (было 15 — спамило ZEC/DOGE)
+ACCUM_COOLDOWN_STRONG_SEC = 600   # 10 мин при сильной (OI+ >= 6%)
+ACCUM_STRONG_THRESH_PCT = 6.0     # OI growth >= 6% = сильная аномалия
+ACCUM_TOP_N = 3              # макс алертов за скан (не спамить ZEC/DOGE/APT)
+ACCUM_IMPROVE_MIN = 0.5      # повтор только если OI% вырос на 0.5%+ с прошлого алерта
+ACCUM_EXCLUDE_Q24H_MAX = 150_000_000  # исключить DOGE и т.п. (всегда накопление, редко анонсы)
 ACCUM_INTERVAL_SEC = 300     # проверка раз в 5 мин
-ACCUM_MIN_Q24H = 3_000_000.0     # минимум ликвидности
+ACCUM_MIN_Q24H = 1_500_000.0     # 1.5M — ловить ESP/GPS до пампа (было 3M)
 
 # --- LS_CALL: Long/Short по Top Trader L/S ratio (отключено — спамило) ---
 USE_LS_CALL_ALERT = False
@@ -1317,22 +1321,27 @@ class Scanner:
                 if self.allowed is not None:
                     symbols = [s for s in symbols if s in self.allowed]
                 symbols = [s for s in symbols if s.endswith("USDT") and s not in BLOCKLIST and s not in STABLE_LIKE]
-                # сортируем по q24h — сначала ликвидные (STRK и т.п. не пропустим)
+                # ACCUM: сортируем по q24h ВОЗРАСТАНИЮ — сначала малые капы (ESP, GPS до пампа)
+                # Топ-80 по объёму = DOGE, SOL... ESP с 2M q24h там #150+. Мы его никогда не проверяли.
                 def _q24h(s):
                     st = STATES.get(s)
                     return float(getattr(st, "q24h", 0) or 0) if st else 0.0
-                symbols = sorted(symbols, key=_q24h, reverse=True)
+                symbols = [s for s in symbols if ACCUM_MIN_Q24H <= _q24h(s) <= ACCUM_EXCLUDE_Q24H_MAX]
+                symbols = sorted(symbols, key=_q24h, reverse=False)
                 if not symbols:
                     continue
 
                 checked = 0
+                accum_signals: List[Tuple[float, str, float, float, float, Optional[float]]] = []  # (score, sym, oi_pct, range_pct, p24h, ls_ratio)
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as http:
-                    for sym in symbols[:80]:  # лимит на итерацию
+                    for sym in symbols[:80]:
                         st = STATES.get(sym)
                         if st is None:
                             continue
                         q24h = float(getattr(st, "q24h", 0.0) or 0.0)
                         if q24h < ACCUM_MIN_Q24H:
+                            continue
+                        if q24h > ACCUM_EXCLUDE_Q24H_MAX:
                             continue
                         p24h = float(getattr(st, "p24h", 0.0))
                         if not (ACCUM_P24H_MIN <= p24h <= ACCUM_P24H_MAX):
@@ -1350,14 +1359,19 @@ class Scanner:
                         if result is None:
                             continue
                         oi_pct, range_pct, score, ls_ratio = result
+                        if last_score > 0 and (oi_pct - last_score) < ACCUM_IMPROVE_MIN:
+                            continue
+                        accum_signals.append((score, sym, oi_pct, range_pct, p24h, ls_ratio))
 
-                        st.last_accum_alert_ts = now
-                        st.last_accum_score = score
-
+                sent = 0
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http_tg:
+                    for score, sym, oi_pct, range_pct, p24h, ls_ratio in sorted(accum_signals, key=lambda x: x[0], reverse=True)[:ACCUM_TOP_N]:
+                        st = STATES.get(sym)
+                        if st is not None:
+                            st.last_accum_alert_ts = now
+                            st.last_accum_score = oi_pct
                         ls_str = f" L/S {ls_ratio:.2f}" if ls_ratio is not None else ""
-                        msg = (
-                            f"{sym} ACCUM (LONG) | OI+{oi_pct:.2f}% 4h | range {range_pct:.2f}% | p24h {p24h:.1f}%{ls_str}"
-                        )
+                        msg = f"{sym} ACCUM (LONG) | OI+{oi_pct:.2f}% 4h | range {range_pct:.2f}% | p24h {p24h:.1f}%{ls_str}"
                         print(msg)
                         if TG_STRUCTURED:
                             tg_msg = fmt_tg_alert(
@@ -1369,10 +1383,12 @@ class Scanner:
                             tg_msg = msg
                         if self.tg_enabled and self.tg_rl.allow():
                             try:
-                                await _tg_send(http, self.tg_token, self.tg_chat_id, tg_msg)
+                                await _tg_send(http_tg, self.tg_token, self.tg_chat_id, tg_msg)
+                                sent += 1
                             except Exception:
                                 pass
-                print(f"[ACCUM] scan done, checked={checked} syms")
+                if checked > 0:
+                    print(f"[ACCUM] scan done, checked={checked} syms, sent={sent}")
             except Exception as e:
                 print(f"[ACCUM] error: {e!r}")
 
@@ -1992,22 +2008,25 @@ class Scanner:
                                         out_rc = fmt_tg_alert(sym, "VERY_HOT RECOVERY_LONG", "LONG", move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel, p24h=p24h, extra_lines=["Отскок после дампа"]) if TG_STRUCTURED else msg_rc
                                         signals.append((105.0 + min(momo_move, 15.0), out_rc))
                                         continue
-                                # PUMPED: p24h > 25% — токен разогрет. OI+ и движение вверх = continuation (LONG), иначе — watch (шорт?)
+                                # PUMPED: p24h > 25%. 25-40% = ранний памп (ESP-тип) → continuation (LONG). >40% = разогрет → watch (шорт?)
                                 if p24h >= PUMPED_WATCH_P24H_MIN:
                                     last_pw = float(getattr(st, "pumped_watch_ts", 0.0))
                                     if (now - last_pw) >= PUMPED_WATCH_COOLDOWN_SEC:
                                         st.pumped_watch_ts = now
                                         oi_delta_pw = oi_pct_change_recent(st.oi, OI_DELTA_WINDOW_SEC)
-                                        # OI растёт + движение вверх = continuation long (STG-тип)
-                                        if oi_delta_pw >= 1.0 and momo_move >= 2.0:
+                                        early_pump = p24h < PUMPED_EARLY_MAX_P24H
+                                        # Ранний памп (25-40%): движение вверх = continuation (LONG), даже без OI (ESP не в OI poller)
+                                        strong_continuation = oi_delta_pw >= 1.0 and momo_move >= 2.0
+                                        weak_continuation = early_pump and momo_move >= 1.5
+                                        if strong_continuation or weak_continuation:
                                             msg_pc = (
                                                 f"{sym} WATCH PUMPED_CONTINUE (LONG) | p24h={p24h:.1f}% move={momo_move:.2f}% OI+{oi_delta_pw:.2f}% | "
                                                 f"vol_accel={momo_accel:.2f}x — продолжение пампа?"
                                             )
                                             print(msg_pc)
-                                            out_pc = fmt_tg_alert(sym, "WATCH PUMPED_CONTINUE", "LONG", move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel, p24h=p24h, extra_lines=[f"OI+{oi_delta_pw:.2f}% — continuation long?"]) if TG_STRUCTURED else msg_pc
+                                            out_pc = fmt_tg_alert(sym, "WATCH PUMPED_CONTINUE", "LONG", move=momo_move, window_sec=MOMO_LOOKBACK_SEC, vol_accel=momo_accel, p24h=p24h, extra_lines=[f"OI+{oi_delta_pw:.2f}% · ранний памп — continuation?"]) if TG_STRUCTURED else msg_pc
                                             signals.append((92.0 + min(momo_move, 15.0), out_pc))
-                                        else:
+                                        elif not early_pump:
                                             msg_pw = (
                                                 f"{sym} WATCH PUMPED_WATCH | p24h={p24h:.1f}% move={momo_move:.2f}%/{MOMO_LOOKBACK_SEC}s | "
                                                 f"vol_accel={momo_accel:.2f}x — токен разогрет, смотри (шорт?)"
@@ -2444,15 +2463,18 @@ class Scanner:
                                     if (now - last_pw) >= PUMPED_WATCH_COOLDOWN_SEC:
                                         st.pumped_watch_ts = now
                                         oi_delta_pw = oi_pct_change_recent(st.oi, OI_DELTA_WINDOW_SEC)
-                                        if oi_delta_pw >= 1.0 and momo_move >= 2.0:
+                                        early_pump = p24h < PUMPED_EARLY_MAX_P24H
+                                        strong_continuation = oi_delta_pw >= 1.0 and momo_move >= 2.0
+                                        weak_continuation = early_pump and momo_move >= 1.5
+                                        if strong_continuation or weak_continuation:
                                             msg_pc = (
                                                 f"{sym} WATCH PUMPED_CONTINUE (LONG) | p24h={p24h:.1f}% move={momo_move:.2f}% OI+{oi_delta_pw:.2f}% | "
                                                 f"vol_accel={momo_accel:.2f}x — продолжение пампа?"
                                             )
                                             print(msg_pc)
-                                            out_pc = fmt_tg_alert(sym, "WATCH PUMPED_CONTINUE", "LONG", move=momo_move, vol_accel=momo_accel, p24h=p24h, extra_lines=[f"OI+{oi_delta_pw:.2f}% — continuation long?"]) if TG_STRUCTURED else msg_pc
+                                            out_pc = fmt_tg_alert(sym, "WATCH PUMPED_CONTINUE", "LONG", move=momo_move, vol_accel=momo_accel, p24h=p24h, extra_lines=[f"OI+{oi_delta_pw:.2f}% · ранний памп — continuation?"]) if TG_STRUCTURED else msg_pc
                                             signals.append((92.0 + min(momo_move, 15.0), out_pc))
-                                        else:
+                                        elif not early_pump:
                                             msg_pw = (
                                                 f"{sym} WATCH PUMPED_WATCH | p24h={p24h:.1f}% move={momo_move:.2f}% | "
                                                 f"vol_accel={momo_accel:.2f}x — токен разогрет, смотри (шорт?)"
