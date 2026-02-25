@@ -33,6 +33,15 @@ class TickerState:
         self.last_accum_alert_ts = 0.0
         self.last_accum_score = 0.0
 
+        # STEALTH_ACCUM
+        self.last_stealth_alert_ts = 0.0
+        self.last_stealth_score = 0.0
+        self.stealth_score = 0.0  # для MOMO: relax RSI если > 70
+
+        # LS_CALL (Long/Short по L/S ratio) — отдельный кулдаун
+        self.last_ls_call_ts = 0.0
+        self.last_ls_call_side = ""  # "LONG" | "SHORT"
+
         self.funding = Ring(200)  # funding rate history
 
         # внутри TickerState
