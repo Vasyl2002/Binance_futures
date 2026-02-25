@@ -60,6 +60,84 @@ async def get_top_long_short_ratio(
         return float(ratio) if ratio is not None else None
 
 
+async def get_global_long_short_account_ratio(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    period: str = "4h",
+    limit: int = 2,
+) -> Optional[float]:
+    """Global L/S by accounts. period: 5m,15m,30m,1h,2h,4h,6h,12h,1d"""
+    url = f"{BASE}/futures/data/globalLongShortAccountRatio"
+    params = {"symbol": symbol, "period": period, "limit": limit}
+    async with session.get(url, params=params, timeout=10) as r:
+        if r.status != 200:
+            return None
+        data = await r.json()
+        if not isinstance(data, list) or not data:
+            return None
+        last = data[-1]
+        ratio = last.get("longShortRatio")
+        return float(ratio) if ratio is not None else None
+
+
+async def get_top_long_short_account_ratio(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    period: str = "4h",
+    limit: int = 2,
+) -> Optional[float]:
+    """Top Trader L/S by accounts. period: 5m,15m,30m,1h,2h,4h,6h,12h,1d"""
+    url = f"{BASE}/futures/data/topLongShortAccountRatio"
+    params = {"symbol": symbol, "period": period, "limit": limit}
+    async with session.get(url, params=params, timeout=10) as r:
+        if r.status != 200:
+            return None
+        data = await r.json()
+        if not isinstance(data, list) or not data:
+            return None
+        last = data[-1]
+        ratio = last.get("longShortRatio")
+        return float(ratio) if ratio is not None else None
+
+
+async def get_top_long_short_position_ratio_hist(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    period: str = "4h",
+    limit: int = 3,
+) -> Optional[List[dict]]:
+    """Top Trader L/S by positions — full history for slope."""
+    url = f"{BASE}/futures/data/topLongShortPositionRatio"
+    params = {"symbol": symbol, "period": period, "limit": limit}
+    async with session.get(url, params=params, timeout=10) as r:
+        if r.status != 200:
+            return None
+        data = await r.json()
+        if not isinstance(data, list) or len(data) < 2:
+            return None
+        return data
+
+
+async def get_taker_long_short_ratio(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    period: str = "4h",
+    limit: int = 2,
+) -> Optional[float]:
+    """Taker Buy/Sell Volume ratio. period: 5m,15m,30m,1h,2h,4h,6h,12h,1d"""
+    url = f"{BASE}/futures/data/takerlongshortRatio"
+    params = {"symbol": symbol, "period": period, "limit": limit}
+    async with session.get(url, params=params, timeout=10) as r:
+        if r.status != 200:
+            return None
+        data = await r.json()
+        if not isinstance(data, list) or not data:
+            return None
+        last = data[-1]
+        ratio = last.get("buySellRatio")
+        return float(ratio) if ratio is not None else None
+
+
 async def get_open_interest(session: aiohttp.ClientSession, symbol: str) -> float:
     url = f"{BASE}/fapi/v1/openInterest"
     async with session.get(url, params={"symbol": symbol}) as r:
