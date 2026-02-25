@@ -15,7 +15,7 @@ class TickerState:
         self.last_q = None
         self.p24h = 0.0
         self.q24h = 0.0  # 24h quote volume (USDT)
-        self.h24h = 0.0  # 24h high
+        self.h24h = 0.0  # 24h highф
         self.l24h = 0.0  # 24h low
 
 
@@ -37,6 +37,7 @@ class TickerState:
         self.last_stealth_alert_ts = 0.0
         self.last_stealth_score = 0.0
         self.stealth_score = 0.0  # для MOMO: relax RSI если > 70
+        self.oi_spike_detected = False  # acceleration > 20% → relax filters
 
         # LS_CALL (Long/Short по L/S ratio) — отдельный кулдаун
         self.last_ls_call_ts = 0.0
