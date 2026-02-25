@@ -13,7 +13,7 @@ from price_signal import price_compression
 from volume_signal import volume_acceleration_time
 from spike_signal import spike_detector
 from binance_rest import get_open_interest_hist, get_klines, get_top_long_short_ratio, get_funding
-from stealth_accum import compute_stealth_score
+from stealth_accum import compute_stealth_squeeze_score, compute_stealth_score
 
 
 # ================== TUNING ==================
@@ -226,11 +226,13 @@ ACCUM_MIN_Q24H = 1_500_000.0     # 1.5M — ловить ESP/GPS до пампа
 
 # --- STEALTH_ACCUM: Stealth Accumulation Score (0-100) — новая логика ---
 USE_STEALTH_ACCUM = True     # True = Stealth Score, False = старый ACCUM
-STEALTH_MIN_SCORE = 65       # 65+ Watchlist, 80+ High Conviction, 90+ Very High
+STEALTH_MIN_SCORE = 70       # 70+ POTENTIAL SQUEEZE/STEALTH, 85+ HIGH CONVICTION
+STEALTH_EARLY_MIN_ACCEL = 15.0  # 1h/2h accel > 15% → EARLY OI GROWTH watch (даже если score < 70)
 STEALTH_TOP_N = 3
 STEALTH_COOLDOWN_SEC = 1800  # 30 мин
 STEALTH_IMPROVE_MIN = 5.0    # повтор только если score вырос на 5+
 STEALTH_RELAX_RSI_AT = 70    # при score > 70 → RSI до 80 ок (в MOMO)
+OI_SPIKE_RSI_MAX = 82        # при oi_spike_detected → RSI до 82, book imb игнор
 
 # --- LS_CALL: Long/Short по Top Trader L/S ratio (отключено — спамило) ---
 USE_LS_CALL_ALERT = False
@@ -1366,14 +1368,18 @@ class Scanner:
 
                         if use_stealth:
                             try:
-                                score, details = await compute_stealth_score(http, sym)
+                                score, details = await compute_stealth_squeeze_score(http, sym)
                             except Exception:
                                 continue
                             checked += 1
                             if st is not None:
                                 st.stealth_score = score
-                            if score < STEALTH_MIN_SCORE:
+                                st.oi_spike_detected = bool(details.get("oi_spike_detected", False))
+                            early_ok = details.get("early_warning") and score >= 50
+                            if score < STEALTH_MIN_SCORE and not early_ok:
                                 continue
+                            if score < STEALTH_MIN_SCORE and early_ok:
+                                details["early_watch_only"] = True
                             if last_score > 0 and (score - last_score) < STEALTH_IMPROVE_MIN:
                                 continue
                             accum_signals.append((score, sym, details))
@@ -1403,12 +1409,16 @@ class Scanner:
 
                         if use_stealth:
                             d = details
-                            level = "Watchlist" if score < 80 else ("High Conviction" if score < 90 else "Very High")
+                            mode = d.get("mode", "STEALTH")
+                            early_only = d.get("early_watch_only", False)
+                            early = " [EARLY OI]" if d.get("early_warning") else ""
+                            level = "EARLY WATCH" if early_only else ("POTENTIAL" if score < 85 else "HIGH CONVICTION")
                             oi4 = d.get("oi_4h")
                             oi6 = d.get("oi_6h")
                             oi24 = d.get("oi_24h")
                             rsi = d.get("rsi")
-                            parts = [f"score {score:.0f} ({level})"]
+                            tag = "EARLY_OI_WATCH" if early_only else "STEALTH_ACCUM"
+                            parts = [f"score {score:.0f} ({level}{early})"]
                             if oi4 is not None:
                                 parts.append(f"OI 4h+{oi4:.1f}%")
                             if oi6 is not None:
@@ -1417,8 +1427,8 @@ class Scanner:
                                 parts.append(f"24h+{oi24:.1f}%")
                             if rsi is not None:
                                 parts.append(f"RSI {rsi:.0f}")
-                            msg = f"{sym} STEALTH_ACCUM (LONG) | " + " · ".join(parts)
-                            extra = [f"Stealth Score {score:.0f} · {level} · накопление до анонса"]
+                            msg = f"{sym} {tag} (LONG) | " + " · ".join(parts)
+                            extra = [f"Score {score:.0f} · {level}" + (" · EARLY OI GROWTH — watch" if early_only else "")]
                             if d.get("oi_4h") is not None:
                                 extra.append(f"OI 4h: +{d['oi_4h']:.1f}%")
                             if d.get("oi_6h") is not None:
@@ -1436,7 +1446,7 @@ class Scanner:
 
                         print(msg)
                         if TG_STRUCTURED:
-                            tg_msg = fmt_tg_alert(sym, "STEALTH_ACCUM" if use_stealth else "ACCUM", "LONG", move=score if use_stealth else details.get("oi_pct", score), extra_lines=extra)
+                            tg_msg = fmt_tg_alert(sym, tag if use_stealth else "ACCUM", "LONG", move=score if use_stealth else details.get("oi_pct", score), extra_lines=extra)
                         else:
                             tg_msg = msg
                         if self.tg_enabled and self.tg_rl.allow():
@@ -2206,11 +2216,15 @@ class Scanner:
                         rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
                         send_to_tg = True
                         # --- Grok: strict momentum gates (exhaustion / strength) ---
-                        # Stealth Score > 70 → relax RSI overbought до 80
+                        # oi_spike_detected → RSI до 82, book imb игнор. Stealth > 70 → RSI до 80.
                         rsi_block_long = RSI_EXHAUST_BLOCK_LONG
                         rsi_max_long = RSI_MAX_LONG
+                        oi_spike = bool(getattr(st, "oi_spike_detected", False))
                         stealth_s = float(getattr(st, "stealth_score", 0) or 0)
-                        if stealth_s >= STEALTH_RELAX_RSI_AT:
+                        if oi_spike:
+                            rsi_block_long = 85.0
+                            rsi_max_long = OI_SPIKE_RSI_MAX
+                        elif stealth_s >= STEALTH_RELAX_RSI_AT:
                             rsi_block_long = 85.0
                             rsi_max_long = 80.0
                         if send_to_tg and rsi is not None:
@@ -2223,7 +2237,7 @@ class Scanner:
                                 send_to_tg = False
                             if momo_move < 0 and momo_taker > MOMO_TAKER_SHORT_MAX:
                                 send_to_tg = False
-                        if send_to_tg and depth_imb is not None:
+                        if send_to_tg and depth_imb is not None and not oi_spike:
                             if momo_move > 0 and (depth_imb < MOMO_IMB_LONG_BLOCK or depth_imb < MOMO_IMB_LONG_MIN):
                                 send_to_tg = False
                             if momo_move < 0 and depth_imb > MOMO_IMB_SHORT_MAX:
