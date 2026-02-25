@@ -3,7 +3,7 @@ import json
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set, Any
 from collections import deque
 
 import aiohttp
@@ -13,6 +13,7 @@ from price_signal import price_compression
 from volume_signal import volume_acceleration_time
 from spike_signal import spike_detector
 from binance_rest import get_open_interest_hist, get_klines, get_top_long_short_ratio, get_funding
+from stealth_accum import compute_stealth_score
 
 
 # ================== TUNING ==================
@@ -222,6 +223,14 @@ ACCUM_IMPROVE_MIN = 0.5      # повтор только если OI% вырос
 ACCUM_EXCLUDE_Q24H_MAX = 150_000_000  # исключить DOGE и т.п. (всегда накопление, редко анонсы)
 ACCUM_INTERVAL_SEC = 300     # проверка раз в 5 мин
 ACCUM_MIN_Q24H = 1_500_000.0     # 1.5M — ловить ESP/GPS до пампа (было 3M)
+
+# --- STEALTH_ACCUM: Stealth Accumulation Score (0-100) — новая логика ---
+USE_STEALTH_ACCUM = True     # True = Stealth Score, False = старый ACCUM
+STEALTH_MIN_SCORE = 65       # 65+ Watchlist, 80+ High Conviction, 90+ Very High
+STEALTH_TOP_N = 3
+STEALTH_COOLDOWN_SEC = 1800  # 30 мин
+STEALTH_IMPROVE_MIN = 5.0    # повтор только если score вырос на 5+
+STEALTH_RELAX_RSI_AT = 70    # при score > 70 → RSI до 80 ок (в MOMO)
 
 # --- LS_CALL: Long/Short по Top Trader L/S ratio (отключено — спамило) ---
 USE_LS_CALL_ALERT = False
@@ -1332,9 +1341,11 @@ class Scanner:
                     continue
 
                 checked = 0
-                accum_signals: List[Tuple[float, str, float, float, float, Optional[float]]] = []  # (score, sym, oi_pct, range_pct, p24h, ls_ratio)
-                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as http:
-                    for sym in symbols[:80]:
+                accum_signals: List[Tuple[float, str, Any]] = []  # (score, sym, details)
+                use_stealth = USE_STEALTH_ACCUM
+                top_n = STEALTH_TOP_N if use_stealth else ACCUM_TOP_N
+                async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as http:
+                    for sym in symbols[:40 if use_stealth else 80]:
                         st = STATES.get(sym)
                         if st is None:
                             continue
@@ -1347,38 +1358,85 @@ class Scanner:
                         if not (ACCUM_P24H_MIN <= p24h <= ACCUM_P24H_MAX):
                             continue
 
-                        last_ts = float(getattr(st, "last_accum_alert_ts", 0.0))
-                        last_score = float(getattr(st, "last_accum_score", 0.0))
-                        is_strong = last_score >= ACCUM_STRONG_THRESH_PCT
-                        cd = ACCUM_COOLDOWN_STRONG_SEC if is_strong else ACCUM_COOLDOWN_NORMAL_SEC
+                        last_ts = float(getattr(st, "last_stealth_alert_ts" if use_stealth else "last_accum_alert_ts", 0.0))
+                        last_score = float(getattr(st, "last_stealth_score" if use_stealth else "last_accum_score", 0.0))
+                        cd = STEALTH_COOLDOWN_SEC if use_stealth else (ACCUM_COOLDOWN_STRONG_SEC if last_score >= ACCUM_STRONG_THRESH_PCT else ACCUM_COOLDOWN_NORMAL_SEC)
                         if now - last_ts < cd:
                             continue
 
-                        result = await self._check_accumulation(http, sym, p24h=p24h)
-                        checked += 1
-                        if result is None:
-                            continue
-                        oi_pct, range_pct, score, ls_ratio = result
-                        if last_score > 0 and (oi_pct - last_score) < ACCUM_IMPROVE_MIN:
-                            continue
-                        accum_signals.append((score, sym, oi_pct, range_pct, p24h, ls_ratio))
+                        if use_stealth:
+                            try:
+                                score, details = await compute_stealth_score(http, sym)
+                            except Exception:
+                                continue
+                            checked += 1
+                            if st is not None:
+                                st.stealth_score = score
+                            if score < STEALTH_MIN_SCORE:
+                                continue
+                            if last_score > 0 and (score - last_score) < STEALTH_IMPROVE_MIN:
+                                continue
+                            accum_signals.append((score, sym, details))
+                        else:
+                            result = await self._check_accumulation(http, sym, p24h=p24h)
+                            checked += 1
+                            if result is None:
+                                continue
+                            oi_pct, range_pct, score, ls_ratio = result
+                            if last_score > 0 and (oi_pct - last_score) < ACCUM_IMPROVE_MIN:
+                                continue
+                            accum_signals.append((score, sym, {"oi_pct": oi_pct, "range_pct": range_pct, "p24h": p24h, "ls_ratio": ls_ratio}))
 
                 sent = 0
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as http_tg:
-                    for score, sym, oi_pct, range_pct, p24h, ls_ratio in sorted(accum_signals, key=lambda x: x[0], reverse=True)[:ACCUM_TOP_N]:
+                    for item in sorted(accum_signals, key=lambda x: x[0], reverse=True)[:top_n]:
+                        score, sym, details = item[0], item[1], item[2]
                         st = STATES.get(sym)
                         if st is not None:
-                            st.last_accum_alert_ts = now
-                            st.last_accum_score = oi_pct
-                        ls_str = f" L/S {ls_ratio:.2f}" if ls_ratio is not None else ""
-                        msg = f"{sym} ACCUM (LONG) | OI+{oi_pct:.2f}% 4h | range {range_pct:.2f}% | p24h {p24h:.1f}%{ls_str}"
+                            if use_stealth:
+                                st.last_stealth_alert_ts = now
+                                st.last_stealth_score = score
+                                st.stealth_score = score
+                            else:
+                                st.last_accum_alert_ts = now
+                                st.last_accum_score = details.get("oi_pct", score)
+
+                        if use_stealth:
+                            d = details
+                            level = "Watchlist" if score < 80 else ("High Conviction" if score < 90 else "Very High")
+                            oi4 = d.get("oi_4h")
+                            oi6 = d.get("oi_6h")
+                            oi24 = d.get("oi_24h")
+                            rsi = d.get("rsi")
+                            parts = [f"score {score:.0f} ({level})"]
+                            if oi4 is not None:
+                                parts.append(f"OI 4h+{oi4:.1f}%")
+                            if oi6 is not None:
+                                parts.append(f"6h+{oi6:.1f}%")
+                            if oi24 is not None:
+                                parts.append(f"24h+{oi24:.1f}%")
+                            if rsi is not None:
+                                parts.append(f"RSI {rsi:.0f}")
+                            msg = f"{sym} STEALTH_ACCUM (LONG) | " + " · ".join(parts)
+                            extra = [f"Stealth Score {score:.0f} · {level} · накопление до анонса"]
+                            if d.get("oi_4h") is not None:
+                                extra.append(f"OI 4h: +{d['oi_4h']:.1f}%")
+                            if d.get("oi_6h") is not None:
+                                extra.append(f"OI 6h: +{d['oi_6h']:.1f}%")
+                            if d.get("rsi") is not None:
+                                extra.append(f"RSI: {d['rsi']:.0f}")
+                        else:
+                            oi_pct = details.get("oi_pct", 0)
+                            range_pct = details.get("range_pct", 0)
+                            p24h = details.get("p24h", 0)
+                            ls_ratio = details.get("ls_ratio")
+                            ls_str = f" L/S {ls_ratio:.2f}" if ls_ratio is not None else ""
+                            msg = f"{sym} ACCUM (LONG) | OI+{oi_pct:.2f}% 4h | range {range_pct:.2f}% | p24h {p24h:.1f}%{ls_str}"
+                            extra = [f"OI+{oi_pct:.2f}% 4h · range {range_pct:.2f}% · p24h {p24h:.1f}%{f' · L/S {ls_ratio:.2f}' if ls_ratio else ''} · накопление до анонса"]
+
                         print(msg)
                         if TG_STRUCTURED:
-                            tg_msg = fmt_tg_alert(
-                                sym, "ACCUM", "LONG",
-                                move=oi_pct,
-                                extra_lines=[f"OI+{oi_pct:.2f}% 4h · range {range_pct:.2f}% · p24h {p24h:.1f}%{f' · L/S {ls_ratio:.2f}' if ls_ratio is not None else ''} · накопление до анонса"],
-                            )
+                            tg_msg = fmt_tg_alert(sym, "STEALTH_ACCUM" if use_stealth else "ACCUM", "LONG", move=score if use_stealth else details.get("oi_pct", score), extra_lines=extra)
                         else:
                             tg_msg = msg
                         if self.tg_enabled and self.tg_rl.allow():
@@ -2148,8 +2206,15 @@ class Scanner:
                         rank = 110.0 + clamp(abs(momo_move), 0.0, 30.0) + clamp(momo_accel, 0.0, 20.0)
                         send_to_tg = True
                         # --- Grok: strict momentum gates (exhaustion / strength) ---
+                        # Stealth Score > 70 → relax RSI overbought до 80
+                        rsi_block_long = RSI_EXHAUST_BLOCK_LONG
+                        rsi_max_long = RSI_MAX_LONG
+                        stealth_s = float(getattr(st, "stealth_score", 0) or 0)
+                        if stealth_s >= STEALTH_RELAX_RSI_AT:
+                            rsi_block_long = 85.0
+                            rsi_max_long = 80.0
                         if send_to_tg and rsi is not None:
-                            if momo_move > 0 and (rsi >= RSI_EXHAUST_BLOCK_LONG or rsi >= RSI_MAX_LONG):
+                            if momo_move > 0 and (rsi >= rsi_block_long or rsi >= rsi_max_long):
                                 send_to_tg = False
                             if momo_move < 0 and (rsi <= RSI_EXHAUST_BLOCK_SHORT or rsi <= RSI_MIN_SHORT):
                                 send_to_tg = False
