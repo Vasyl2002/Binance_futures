@@ -220,7 +220,7 @@ ACCUM_COOLDOWN_STRONG_SEC = 600   # 10 мин при сильной (OI+ >= 6%)
 ACCUM_STRONG_THRESH_PCT = 6.0     # OI growth >= 6% = сильная аномалия
 ACCUM_TOP_N = 3              # макс алертов за скан (не спамить ZEC/DOGE/APT)
 ACCUM_IMPROVE_MIN = 0.5      # повтор только если OI% вырос на 0.5%+ с прошлого алерта
-ACCUM_EXCLUDE_Q24H_MAX = 150_000_000  # исключить DOGE и т.п. (всегда накопление, редко анонсы)
+ACCUM_EXCLUDE_Q24H_MAX = 350_000_000  # исключить DOGE и т.п. (всегда накопление, редко анонсы)
 ACCUM_INTERVAL_SEC = 300     # проверка раз в 5 мин
 ACCUM_MIN_Q24H = 1_500_000.0     # 1.5M — ловить ESP/GPS до пампа (было 3M)
 
@@ -2943,3 +2943,4 @@ class Scanner:
                                 await _tg_send(http, self.tg_token, self.tg_chat_id, msg)
                             except Exception:
                                 pass
+
