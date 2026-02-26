@@ -94,7 +94,7 @@ MAX_P24H_DOWN_PCT = 15.0
 # ===== MOMO / IMPULSE =====
 MOMO_LOOKBACK_SEC = 120          # смотрим импульс за 2 минуты
 MOMO_CONFIRM_SEC = 20            # подтверждение что импульс “сейчас продолжается”
-MOMO_MIN_MOVE_PCT = 2.5
+MOMO_MIN_MOVE_PCT = 999.0       # было 2.5 — по сути отключаем MOMO, оставляем Stealth/OI
 MOMO_CONFIRM_MIN_PCT = 1.0       # минимум % за CONFIRM — движение "сейчас"
 
 MOMO_VOL_SHORT_SEC = 10
@@ -141,7 +141,7 @@ AGG_TRADES_TTL_SEC = 30.0
 USE_5M_TREND_FILTER = False    # отключено для упрощения (много пропусков)
 CANDLE_5M_SEC = 300
 TREND_5M_BARS = 3
-MOMO_MIN_MOVE_PCT = 2.5       # для “пампа” подними 2.0–4.0
+MOMO_MIN_MOVE_PCT = 999.0     # дублируем высокий порог для полной деактивации MOMO
 MOMO_VOL_ACCEL_THRESH = 6.0
 MOMO_COOLDOWN_SEC = 120
 
@@ -220,17 +220,17 @@ ACCUM_COOLDOWN_STRONG_SEC = 600   # 10 мин при сильной (OI+ >= 6%)
 ACCUM_STRONG_THRESH_PCT = 6.0     # OI growth >= 6% = сильная аномалия
 ACCUM_TOP_N = 3              # макс алертов за скан (не спамить ZEC/DOGE/APT)
 ACCUM_IMPROVE_MIN = 0.5      # повтор только если OI% вырос на 0.5%+ с прошлого алерта
-ACCUM_EXCLUDE_Q24H_MAX = 350_000_000  # исключить DOGE и т.п. (всегда накопление, редко анонсы)
+ACCUM_EXCLUDE_Q24H_MAX = 1_000_000_000  # раньше 150M — отсекало крупные, теперь ловим и большие имена
 ACCUM_INTERVAL_SEC = 300     # проверка раз в 5 мин
 ACCUM_MIN_Q24H = 1_500_000.0     # 1.5M — ловить ESP/GPS до пампа (было 3M)
 
 # --- STEALTH_ACCUM: Stealth Accumulation Score (0-100) — новая логика ---
 USE_STEALTH_ACCUM = True     # True = Stealth Score, False = старый ACCUM
-STEALTH_MIN_SCORE = 70       # 70+ POTENTIAL SQUEEZE/STEALTH, 85+ HIGH CONVICTION
+STEALTH_MIN_SCORE = 60       # 60+ POTENTIAL SQUEEZE/STEALTH, 80+ HIGH CONVICTION (чуть раньше даём вход)
 STEALTH_EARLY_MIN_ACCEL = 15.0  # 1h/2h accel > 15% → EARLY OI GROWTH watch (даже если score < 70)
 STEALTH_TOP_N = 3
 STEALTH_COOLDOWN_SEC = 1800  # 30 мин
-STEALTH_IMPROVE_MIN = 5.0    # повтор только если score вырос на 5+
+STEALTH_IMPROVE_MIN = 4.0    # чуть мягче: повтор от +4 к прошлому score
 STEALTH_RELAX_RSI_AT = 70    # при score > 70 → RSI до 80 ок (в MOMO)
 OI_SPIKE_RSI_MAX = 82        # при oi_spike_detected → RSI до 82, book imb игнор
 
@@ -2943,4 +2943,3 @@ class Scanner:
                                 await _tg_send(http, self.tg_token, self.tg_chat_id, msg)
                             except Exception:
                                 pass
-
