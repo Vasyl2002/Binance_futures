@@ -19,7 +19,7 @@ from binance_rest import (
 # --- Rolling storage: symbol -> {period -> deque of (oi_delta, price_delta, ts)} ---
 _ROLLING: Dict[str, Dict[str, deque]] = {}
 _ROLLING_MAX = 8
-_OI_SPIKE_THRESH = 20.0  # acceleration > 20% → oi_spike_detected
+_OI_SPIKE_THRESH = 15.0  # раньше 20%, теперь ловим более ранние ускорения OI
 
 
 def _get_rolling(symbol: str, period: str) -> deque:
@@ -87,29 +87,29 @@ def _ls_position_slope(hist: list) -> bool:
 
 
 # --- Squeeze thresholds (ORDER-тип) ---
-SQUEEZE_4H_ACCEL_MIN = 22.0
-SQUEEZE_4H_PRICE_MIN = 5.0
-SQUEEZE_6H_ACCEL_MIN = 28.0
-SQUEEZE_6H_TAKER_MIN = 1.8
-SQUEEZE_2H_ACCEL_MIN = 20.0
+SQUEEZE_4H_ACCEL_MIN = 16.0   # было 22.0 — делаем чувствительней
+SQUEEZE_4H_PRICE_MIN = 3.0    # было 5.0 — дозволяем более ранний ход цены
+SQUEEZE_6H_ACCEL_MIN = 20.0   # было 28.0
+SQUEEZE_6H_TAKER_MIN = 1.6    # было 1.8
+SQUEEZE_2H_ACCEL_MIN = 14.0   # было 20.0
 SQUEEZE_12H_ACCEL_MIN = 0.0
 SQUEEZE_24H_ACCEL_MIN = 0.0
 
 # --- Stealth thresholds (ESP/DOLO) ---
-STEALTH_4H_OI_MIN = 20.0
+STEALTH_4H_OI_MIN = 15.0      # было 20.0 — чуть раньше распознаём накопление
 STEALTH_4H_PRICE_MAX = 12.0
-STEALTH_6H_OI_MIN = 30.0
+STEALTH_6H_OI_MIN = 22.0      # было 30.0
 STEALTH_6H_PRICE_MAX = 15.0
-STEALTH_12H_OI_MIN = 45.0
-STEALTH_24H_OI_MIN = 55.0
+STEALTH_12H_OI_MIN = 35.0     # было 45.0
+STEALTH_24H_OI_MIN = 45.0     # было 55.0
 STEALTH_24H_PRICE_MAX = 25.0
-STEALTH_4H_LS_ACCOUNTS_MIN = 1.35
-STEALTH_6H_TAKER_MIN = 1.7
-STEALTH_12H_LS_POS_MIN = 1.4  # + slope > 0
+STEALTH_4H_LS_ACCOUNTS_MIN = 1.30  # было 1.35
+STEALTH_6H_TAKER_MIN = 1.6         # было 1.7
+STEALTH_12H_LS_POS_MIN = 1.35      # было 1.4 (+ slope > 0 остаётся)
 
 # --- Early warning ---
-EARLY_1H_ACCEL_MIN = 15.0
-EARLY_2H_ACCEL_MIN = 15.0
+EARLY_1H_ACCEL_MIN = 10.0    # было 15.0 — ранний алерт по 1h/2h ускорению
+EARLY_2H_ACCEL_MIN = 10.0
 
 # --- RSI ---
 STEALTH_RSI_LO = 55
