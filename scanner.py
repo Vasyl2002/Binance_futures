@@ -1347,7 +1347,8 @@ class Scanner:
                 use_stealth = USE_STEALTH_ACCUM
                 top_n = STEALTH_TOP_N if use_stealth else ACCUM_TOP_N
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as http:
-                    for sym in symbols[:40 if use_stealth else 80]:
+                    # расширяем охват для Stealth: вместо топ-40 по q24h берём топ-80
+                    for sym in symbols[:80 if use_stealth else 80]:
                         st = STATES.get(sym)
                         if st is None:
                             continue
