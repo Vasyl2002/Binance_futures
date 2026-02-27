@@ -96,16 +96,17 @@ SQUEEZE_12H_ACCEL_MIN = 0.0
 SQUEEZE_24H_ACCEL_MIN = 0.0
 
 # --- Stealth thresholds (ESP/DOLO) ---
-STEALTH_4H_OI_MIN = 15.0      # было 20.0 — чуть раньше распознаём накопление
-STEALTH_4H_PRICE_MAX = 12.0
-STEALTH_6H_OI_MIN = 22.0      # было 30.0
-STEALTH_6H_PRICE_MAX = 15.0
-STEALTH_12H_OI_MIN = 35.0     # было 45.0
-STEALTH_24H_OI_MIN = 45.0     # было 55.0
-STEALTH_24H_PRICE_MAX = 25.0
-STEALTH_4H_LS_ACCOUNTS_MIN = 1.30  # было 1.35
-STEALTH_6H_TAKER_MIN = 1.6         # было 1.7
-STEALTH_12H_LS_POS_MIN = 1.35      # было 1.4 (+ slope > 0 остаётся)
+# Делаем Stealth заметно чувствительней, чтобы ловить ранние накопления даже с умеренным OI.
+STEALTH_4H_OI_MIN = 8.0       # раньше 15.0
+STEALTH_4H_PRICE_MAX = 15.0   # позволяем чуть больший ход цены за 4h
+STEALTH_6H_OI_MIN = 15.0      # раньше 22.0
+STEALTH_6H_PRICE_MAX = 18.0
+STEALTH_12H_OI_MIN = 25.0     # раньше 35.0
+STEALTH_24H_OI_MIN = 30.0     # раньше 45.0
+STEALTH_24H_PRICE_MAX = 30.0
+STEALTH_4H_LS_ACCOUNTS_MIN = 1.25  # раньше 1.30
+STEALTH_6H_TAKER_MIN = 1.5         # раньше 1.6
+STEALTH_12H_LS_POS_MIN = 1.30      # немного мягче
 
 # --- Early warning ---
 EARLY_1H_ACCEL_MIN = 10.0    # было 15.0 — ранний алерт по 1h/2h ускорению
