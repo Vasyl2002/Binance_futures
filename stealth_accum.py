@@ -109,8 +109,14 @@ STEALTH_6H_TAKER_MIN = 1.5         # раньше 1.6
 STEALTH_12H_LS_POS_MIN = 1.30      # немного мягче
 
 # --- Early warning ---
-EARLY_1H_ACCEL_MIN = 10.0    # было 15.0 — ранний алерт по 1h/2h ускорению
+EARLY_1H_ACCEL_MIN = 10.0    # ранний алерт по 1h/2h ускорению
 EARLY_2H_ACCEL_MIN = 10.0
+
+# --- Simple 5m OI+L/S early trigger ---
+SIMPLE_5M_LIMIT = 8          # сколько 5m баров смотрим (до 40 минут)
+SIMPLE_5M_OI_MIN_PCT = 0.8   # минимальный общий рост OI за окно
+SIMPLE_5M_POSITIVE_BARS = 3  # минимум растущих баров подряд
+SIMPLE_5M_LS_MIN = 1.10      # Top Trader L/S (accounts) в сторону лонгов
 
 # --- RSI ---
 STEALTH_RSI_LO = 55
@@ -136,6 +142,37 @@ async def compute_stealth_squeeze_score(
 
     accel_1h = None
     accel_2h = None
+
+    # --- Simple 5m OI + L/S (extra early flag) ---
+    try:
+        oi_5m = await get_open_interest_hist(session, symbol, period="5m", limit=SIMPLE_5M_LIMIT)
+        ls_5m = await get_top_long_short_account_ratio(session, symbol, period="5m", limit=2)
+    except Exception:
+        oi_5m, ls_5m = None, None
+
+    if oi_5m and len(oi_5m) >= 4:
+        # общий рост OI за окно
+        simple_oi_pct = _oi_delta_pct(oi_5m, bars_back=min(3, len(oi_5m) - 1))
+        # количество "зелёных" баров OI подряд в конце
+        inc_streak = 0
+        for i in range(len(oi_5m) - 1, 0, -1):
+            prev_v = float(oi_5m[i - 1].get("sumOpenInterest", 0) or 0)
+            cur_v = float(oi_5m[i].get("sumOpenInterest", 0) or 0)
+            if prev_v > 0 and cur_v > prev_v:
+                inc_streak += 1
+            else:
+                break
+        ls_val = float(ls_5m[-1].get("longShortRatio", 0) or 0) if ls_5m else 1.0
+        if (
+            simple_oi_pct is not None
+            and simple_oi_pct >= SIMPLE_5M_OI_MIN_PCT
+            and inc_streak >= SIMPLE_5M_POSITIVE_BARS
+            and ls_val >= SIMPLE_5M_LS_MIN
+        ):
+            details["simple_5m_oi_pct"] = simple_oi_pct
+            details["simple_5m_inc_streak"] = inc_streak
+            details["simple_5m_ls"] = ls_val
+            early_warning = True
 
     # --- 1h (early warning) ---
     oi_1h = await get_open_interest_hist(session, symbol, period="1h", limit=4)
