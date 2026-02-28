@@ -114,9 +114,12 @@ EARLY_2H_ACCEL_MIN = 10.0
 
 # --- Simple 5m OI+L/S early trigger ---
 SIMPLE_5M_LIMIT = 8          # сколько 5m баров смотрим (до 40 минут)
-SIMPLE_5M_OI_MIN_PCT = 0.8   # минимальный общий рост OI за окно
-SIMPLE_5M_POSITIVE_BARS = 3  # минимум растущих баров подряд
-SIMPLE_5M_LS_MIN = 1.10      # Top Trader L/S (accounts) в сторону лонгов
+SIMPLE_5M_OI_MIN_PCT = 0.5   # минимальный общий рост OI (было 0.8)
+SIMPLE_5M_POSITIVE_BARS = 2  # минимум растущих баров подряд (было 3)
+SIMPLE_5M_LS_MIN = 1.05      # Top Trader L/S в сторону лонгов (было 1.10)
+# --- Fallback: сильный рост OI за 4h/6h без ускорения → всё равно early_warning ---
+OI_FALLBACK_4H_PCT = 8.0     # OI 4h +8% → early_warning
+OI_FALLBACK_6H_PCT = 10.0    # OI 6h +10% → early_warning
 
 # --- RSI ---
 STEALTH_RSI_LO = 55
@@ -266,6 +269,14 @@ async def compute_stealth_squeeze_score(
     if taker_6h is not None and taker_6h >= STEALTH_6H_TAKER_MIN:
         stealth_score += 20
         details["stealth_6h_taker_pts"] = 20
+
+    # Fallback: сильный рост OI 4h/6h без ускорения → всё равно early_warning (чтобы не было нуля алертов)
+    if oi_d4 is not None and oi_d4 >= OI_FALLBACK_4H_PCT:
+        early_warning = True
+        details["oi_fallback_4h"] = oi_d4
+    if oi_d6 is not None and oi_d6 >= OI_FALLBACK_6H_PCT:
+        early_warning = True
+        details["oi_fallback_6h"] = oi_d6
 
     # --- 12h (fix oi_d12 for stealth) ---
     oi_12h = await get_open_interest_hist(session, symbol, period="12h", limit=4)
