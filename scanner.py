@@ -224,6 +224,7 @@ ACCUM_EXCLUDE_Q24H_MAX = 1_000_000_000  # раньше 150M — отсекало
 ACCUM_INTERVAL_SEC = 300     # проверка раз в 5 мин
 ACCUM_MIN_Q24H = 1_500_000.0     # 1.5M — ловить ESP/GPS до пампа (было 3M)
 ACCUM_BATCH_SIZE = 12        # параллельная проверка Stealth: 12 символов одновременно
+ACCUM_MAX_SYMS = 150        # сколько символов проверять (по q24h asc). 80 = только микрокапы; 150 чтобы ловить FIO/GRASS (~20–25M vol)
 
 # --- STEALTH_ACCUM: Stealth Accumulation Score (0-100) — новая логика ---
 USE_STEALTH_ACCUM = True     # True = Stealth Score, False = старый ACCUM
@@ -1347,7 +1348,7 @@ class Scanner:
                 accum_signals: List[Tuple[float, str, Any]] = []  # (score, sym, details)
                 use_stealth = USE_STEALTH_ACCUM
                 top_n = STEALTH_TOP_N if use_stealth else ACCUM_TOP_N
-                max_syms = 80 if use_stealth else 80
+                max_syms = ACCUM_MAX_SYMS
 
                 # Pre-filter candidates (q24h, p24h, cooldown)
                 candidates: List[Tuple[str, Any]] = []
