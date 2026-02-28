@@ -223,6 +223,7 @@ ACCUM_IMPROVE_MIN = 0.5      # повтор только если OI% вырос
 ACCUM_EXCLUDE_Q24H_MAX = 1_000_000_000  # раньше 150M — отсекало крупные, теперь ловим и большие имена
 ACCUM_INTERVAL_SEC = 300     # проверка раз в 5 мин
 ACCUM_MIN_Q24H = 1_500_000.0     # 1.5M — ловить ESP/GPS до пампа (было 3M)
+ACCUM_BATCH_SIZE = 12        # параллельная проверка Stealth: 12 символов одновременно
 
 # --- STEALTH_ACCUM: Stealth Accumulation Score (0-100) — новая логика ---
 USE_STEALTH_ACCUM = True     # True = Stealth Score, False = старый ACCUM
@@ -1346,47 +1347,56 @@ class Scanner:
                 accum_signals: List[Tuple[float, str, Any]] = []  # (score, sym, details)
                 use_stealth = USE_STEALTH_ACCUM
                 top_n = STEALTH_TOP_N if use_stealth else ACCUM_TOP_N
+                max_syms = 80 if use_stealth else 80
+
+                # Pre-filter candidates (q24h, p24h, cooldown)
+                candidates: List[Tuple[str, Any]] = []
+                for sym in symbols[:max_syms]:
+                    st = STATES.get(sym)
+                    if st is None:
+                        continue
+                    q24h = float(getattr(st, "q24h", 0.0) or 0.0)
+                    if q24h < ACCUM_MIN_Q24H or q24h > ACCUM_EXCLUDE_Q24H_MAX:
+                        continue
+                    p24h = float(getattr(st, "p24h", 0.0))
+                    if not (ACCUM_P24H_MIN <= p24h <= ACCUM_P24H_MAX):
+                        continue
+                    last_ts = float(getattr(st, "last_stealth_alert_ts" if use_stealth else "last_accum_alert_ts", 0.0))
+                    last_score = float(getattr(st, "last_stealth_score" if use_stealth else "last_accum_score", 0.0))
+                    cd = STEALTH_COOLDOWN_SEC if use_stealth else (ACCUM_COOLDOWN_STRONG_SEC if last_score >= ACCUM_STRONG_THRESH_PCT else ACCUM_COOLDOWN_NORMAL_SEC)
+                    if now - last_ts < cd:
+                        continue
+                    candidates.append((sym, st))
+
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as http:
-                    # расширяем охват для Stealth: вместо топ-40 по q24h берём топ-80
-                    for sym in symbols[:80 if use_stealth else 80]:
-                        st = STATES.get(sym)
-                        if st is None:
-                            continue
-                        q24h = float(getattr(st, "q24h", 0.0) or 0.0)
-                        if q24h < ACCUM_MIN_Q24H:
-                            continue
-                        if q24h > ACCUM_EXCLUDE_Q24H_MAX:
-                            continue
-                        p24h = float(getattr(st, "p24h", 0.0))
-                        if not (ACCUM_P24H_MIN <= p24h <= ACCUM_P24H_MAX):
-                            continue
-
-                        last_ts = float(getattr(st, "last_stealth_alert_ts" if use_stealth else "last_accum_alert_ts", 0.0))
-                        last_score = float(getattr(st, "last_stealth_score" if use_stealth else "last_accum_score", 0.0))
-                        cd = STEALTH_COOLDOWN_SEC if use_stealth else (ACCUM_COOLDOWN_STRONG_SEC if last_score >= ACCUM_STRONG_THRESH_PCT else ACCUM_COOLDOWN_NORMAL_SEC)
-                        if now - last_ts < cd:
-                            continue
-
-                        if use_stealth:
-                            try:
-                                score, details = await compute_stealth_squeeze_score(http, sym)
-                            except Exception:
-                                continue
-                            checked += 1
-                            if st is not None:
-                                st.stealth_score = score
-                                st.oi_spike_detected = bool(details.get("oi_spike_detected", False))
-                            early_flag = bool(details.get("early_warning"))
-                            # Если есть раннее ускорение OI (early_warning), всегда даём хотя бы EARLY_OI_WATCH,
-                            # даже если суммарный score ниже основного порога.
-                            if score < STEALTH_MIN_SCORE and not early_flag:
-                                continue
-                            if score < STEALTH_MIN_SCORE and early_flag:
-                                details["early_watch_only"] = True
-                            if last_score > 0 and (score - last_score) < STEALTH_IMPROVE_MIN:
-                                continue
-                            accum_signals.append((score, sym, details))
-                        else:
+                    if use_stealth:
+                        # Параллельная проверка батчами по ACCUM_BATCH_SIZE
+                        batch_size = ACCUM_BATCH_SIZE
+                        for i in range(0, len(candidates), batch_size):
+                            batch = candidates[i : i + batch_size]
+                            tasks = [compute_stealth_squeeze_score(http, sym) for sym, _ in batch]
+                            results = await asyncio.gather(*tasks, return_exceptions=True)
+                            for (sym, st), res in zip(batch, results):
+                                if isinstance(res, Exception):
+                                    continue
+                                score, details = res
+                                checked += 1
+                                if st is not None:
+                                    st.stealth_score = score
+                                    st.oi_spike_detected = bool(details.get("oi_spike_detected", False))
+                                last_score = float(getattr(st, "last_stealth_score", 0.0))
+                                early_flag = bool(details.get("early_warning"))
+                                if score < STEALTH_MIN_SCORE and not early_flag:
+                                    continue
+                                if score < STEALTH_MIN_SCORE and early_flag:
+                                    details["early_watch_only"] = True
+                                if last_score > 0 and (score - last_score) < STEALTH_IMPROVE_MIN:
+                                    continue
+                                accum_signals.append((score, sym, details))
+                    else:
+                        for sym, st in candidates:
+                            p24h = float(getattr(st, "p24h", 0.0))
+                            last_score = float(getattr(st, "last_accum_score", 0.0))
                             result = await self._check_accumulation(http, sym, p24h=p24h)
                             checked += 1
                             if result is None:
