@@ -224,13 +224,13 @@ ACCUM_EXCLUDE_Q24H_MAX = 1_000_000_000  # раньше 150M — отсекало
 ACCUM_INTERVAL_SEC = 300     # проверка раз в 5 мин
 ACCUM_MIN_Q24H = 1_500_000.0     # 1.5M — ловить ESP/GPS до пампа (было 3M)
 ACCUM_BATCH_SIZE = 12        # параллельная проверка Stealth: 12 символов одновременно
-ACCUM_MAX_SYMS = 150        # сколько символов проверять (по q24h asc). 80 = только микрокапы; 150 чтобы ловить FIO/GRASS (~20–25M vol)
+ACCUM_MAX_SYMS = 220        # проверять до 220 символов (по q24h asc), чтобы COS/FORM (~29M/15M vol) попадали
 
 # --- STEALTH_ACCUM: Stealth Accumulation Score (0-100) — новая логика ---
 USE_STEALTH_ACCUM = True     # True = Stealth Score, False = старый ACCUM
 STEALTH_MIN_SCORE = 50       # 50+ даём алерт; иначе полный ноль при жёстких порогах
 STEALTH_EARLY_MIN_ACCEL = 15.0  # 1h/2h accel > 15% → EARLY OI GROWTH watch (даже если score < 70)
-STEALTH_TOP_N = 3
+STEALTH_TOP_N = 5            # макс алертов за цикл (было 3 — COS/FORM могли быть 4–5-ми по score)
 STEALTH_COOLDOWN_SEC = 1800  # 30 мин
 STEALTH_IMPROVE_MIN = 4.0    # чуть мягче: повтор от +4 к прошлому score
 STEALTH_RELAX_RSI_AT = 70    # при score > 70 → RSI до 80 ок (в MOMO)
@@ -1369,6 +1369,9 @@ class Scanner:
                         continue
                     candidates.append((sym, st))
 
+                pool_size = len(symbols[:max_syms])
+                print(f"[ACCUM] pool={pool_size} (from {len(symbols)} USDT) | after_prefilter={len(candidates)} candidates")
+
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as http:
                     if use_stealth:
                         # Параллельная проверка батчами по ACCUM_BATCH_SIZE
@@ -1469,8 +1472,10 @@ class Scanner:
                                 sent += 1
                             except Exception:
                                 pass
-                if checked > 0:
-                    print(f"[ACCUM] scan done, checked={checked} syms, sent={sent}")
+                if checked > 0 or len(candidates) > 0:
+                    passed = len(accum_signals)
+                    passed_syms = ",".join(sym for _, sym, _ in accum_signals) if accum_signals else "—"
+                    print(f"[ACCUM] scan done | checked={checked} scored, passed={passed} → [{passed_syms}] sent={sent}")
             except Exception as e:
                 print(f"[ACCUM] error: {e!r}")
 
