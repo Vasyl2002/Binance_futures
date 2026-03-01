@@ -118,8 +118,8 @@ SIMPLE_5M_OI_MIN_PCT = 0.5   # минимальный общий рост OI (б
 SIMPLE_5M_POSITIVE_BARS = 2  # минимум растущих баров подряд (было 3)
 SIMPLE_5M_LS_MIN = 1.05      # Top Trader L/S в сторону лонгов (было 1.10)
 # --- Fallback: сильный рост OI за 4h/6h без ускорения → всё равно early_warning ---
-OI_FALLBACK_4H_PCT = 8.0     # OI 4h +8% → early_warning
-OI_FALLBACK_6H_PCT = 10.0    # OI 6h +10% → early_warning
+OI_FALLBACK_4H_PCT = 5.0     # OI 4h +5% → early_warning (было 8, чтобы ловить COS/FORM)
+OI_FALLBACK_6H_PCT = 7.0     # OI 6h +7% → early_warning (было 10)
 
 # --- RSI ---
 STEALTH_RSI_LO = 55
