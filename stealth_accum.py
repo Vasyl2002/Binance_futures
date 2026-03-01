@@ -112,14 +112,17 @@ STEALTH_12H_LS_POS_MIN = 1.30      # немного мягче
 EARLY_1H_ACCEL_MIN = 10.0    # ранний алерт по 1h/2h ускорению
 EARLY_2H_ACCEL_MIN = 10.0
 
-# --- Simple 5m OI+L/S early trigger ---
-SIMPLE_5M_LIMIT = 8          # сколько 5m баров смотрим (до 40 минут)
-SIMPLE_5M_OI_MIN_PCT = 0.5   # минимальный общий рост OI (было 0.8)
-SIMPLE_5M_POSITIVE_BARS = 2  # минимум растущих баров подряд (было 3)
-SIMPLE_5M_LS_MIN = 1.05      # Top Trader L/S в сторону лонгов (было 1.10)
-# --- Fallback: сильный рост OI за 4h/6h без ускорения → всё равно early_warning ---
-OI_FALLBACK_4H_PCT = 5.0     # OI 4h +5% → early_warning (было 8, чтобы ловить COS/FORM)
-OI_FALLBACK_6H_PCT = 7.0     # OI 6h +7% → early_warning (было 10)
+# --- Simple 5m OI+L/S early trigger (очень мягко — чтобы хоть что-то срабатывало) ---
+SIMPLE_5M_LIMIT = 8
+SIMPLE_5M_OI_MIN_PCT = 0.25  # любой заметный рост OI за окно
+SIMPLE_5M_POSITIVE_BARS = 1  # хотя бы 1 бар вверх
+SIMPLE_5M_LS_MIN = 0.85     # не требуем лонг: ловим и при нейтрале/лёгком шорте (ALICE был в шортах)
+# --- Fallback: любой рост OI 4h/6h → early_warning ---
+OI_FALLBACK_4H_PCT = 2.0    # OI 4h +2% → early_warning
+OI_FALLBACK_6H_PCT = 3.0    # OI 6h +3% → early_warning
+# --- Ещё мягче: минимальный рост OI уже даёт early ---
+OI_ANY_4H_PCT = 1.0         # OI 4h +1% → early_warning
+OI_ANY_6H_PCT = 1.5         # OI 6h +1.5% → early_warning
 
 # --- RSI ---
 STEALTH_RSI_LO = 55
@@ -270,13 +273,21 @@ async def compute_stealth_squeeze_score(
         stealth_score += 20
         details["stealth_6h_taker_pts"] = 20
 
-    # Fallback: сильный рост OI 4h/6h без ускорения → всё равно early_warning (чтобы не было нуля алертов)
-    if oi_d4 is not None and oi_d4 >= OI_FALLBACK_4H_PCT:
-        early_warning = True
-        details["oi_fallback_4h"] = oi_d4
-    if oi_d6 is not None and oi_d6 >= OI_FALLBACK_6H_PCT:
-        early_warning = True
-        details["oi_fallback_6h"] = oi_d6
+    # Fallback: рост OI 4h/6h → early_warning (чтобы не было нуля алертов)
+    if oi_d4 is not None:
+        if oi_d4 >= OI_FALLBACK_4H_PCT:
+            early_warning = True
+            details["oi_fallback_4h"] = oi_d4
+        elif oi_d4 >= OI_ANY_4H_PCT:
+            early_warning = True
+            details["oi_any_4h"] = oi_d4
+    if oi_d6 is not None:
+        if oi_d6 >= OI_FALLBACK_6H_PCT:
+            early_warning = True
+            details["oi_fallback_6h"] = oi_d6
+        elif oi_d6 >= OI_ANY_6H_PCT:
+            early_warning = True
+            details["oi_any_6h"] = oi_d6
 
     # --- 12h (fix oi_d12 for stealth) ---
     oi_12h = await get_open_interest_hist(session, symbol, period="12h", limit=4)
