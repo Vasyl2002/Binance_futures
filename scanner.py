@@ -1353,25 +1353,40 @@ class Scanner:
 
                 # Pre-filter candidates (q24h, p24h, cooldown)
                 candidates: List[Tuple[str, Any]] = []
-                for sym in symbols[:max_syms]:
+                skip_p24h = 0
+                skip_cooldown = 0
+                pool_slice = symbols[:max_syms]
+                for sym in pool_slice:
                     st = STATES.get(sym)
                     if st is None:
                         continue
                     q24h = float(getattr(st, "q24h", 0.0) or 0.0)
                     if q24h < ACCUM_MIN_Q24H or q24h > ACCUM_EXCLUDE_Q24H_MAX:
                         continue
-                    p24h = float(getattr(st, "p24h", 0.0))
+                    p24h_raw = getattr(st, "p24h", 0.0)
+                    p24h = float(p24h_raw) if p24h_raw is not None else 0.0
                     if not (ACCUM_P24H_MIN <= p24h <= ACCUM_P24H_MAX):
+                        skip_p24h += 1
                         continue
                     last_ts = float(getattr(st, "last_stealth_alert_ts" if use_stealth else "last_accum_alert_ts", 0.0))
                     last_score = float(getattr(st, "last_stealth_score" if use_stealth else "last_accum_score", 0.0))
                     cd = STEALTH_COOLDOWN_SEC if use_stealth else (ACCUM_COOLDOWN_STRONG_SEC if last_score >= ACCUM_STRONG_THRESH_PCT else ACCUM_COOLDOWN_NORMAL_SEC)
                     if now - last_ts < cd:
+                        skip_cooldown += 1
                         continue
                     candidates.append((sym, st))
 
-                pool_size = len(symbols[:max_syms])
-                print(f"[ACCUM] pool={pool_size} (from {len(symbols)} USDT) | after_prefilter={len(candidates)} candidates")
+                pool_size = len(pool_slice)
+                print(f"[ACCUM] pool={pool_size} (from {len(symbols)} USDT) | after_prefilter={len(candidates)} (skip_p24h={skip_p24h}, skip_cd={skip_cooldown})")
+                if pool_size > 0 and len(candidates) == 0 and (skip_p24h > 0 or skip_cooldown > 0):
+                    # примеры p24h чтобы понять формат
+                    sample = []
+                    for sym in pool_slice[:5]:
+                        st = STATES.get(sym)
+                        if st is not None:
+                            p = getattr(st, "p24h", None)
+                            sample.append(f"{sym}={p}")
+                    print(f"[ACCUM] sample p24h: {', '.join(sample)}")
 
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as http:
                     if use_stealth:
