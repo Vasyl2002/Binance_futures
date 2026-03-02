@@ -1398,6 +1398,7 @@ class Scanner:
                             results = await asyncio.gather(*tasks, return_exceptions=True)
                             for (sym, st), res in zip(batch, results):
                                 if isinstance(res, Exception):
+                                    print(f"[ACCUM][ERR] {sym}: {repr(res)}")
                                     continue
                                 score, details = res
                                 checked += 1
