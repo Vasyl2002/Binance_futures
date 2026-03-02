@@ -1408,6 +1408,24 @@ class Scanner:
                                     st.oi_spike_detected = bool(details.get("oi_spike_detected", False))
                                 last_score = float(getattr(st, "last_stealth_score", 0.0))
                                 early_flag = bool(details.get("early_warning"))
+
+                                # Глобальный фильтр по росту OI:
+                                # - «короткие» окна 1h/2h → ищем хотя бы +3%
+                                # - «длинные» 4h/6h/24h → хотя бы +5%
+                                oi1 = details.get("oi_1h")
+                                oi2 = details.get("oi_2h")
+                                oi4 = details.get("oi_4h")
+                                oi6 = details.get("oi_6h")
+                                oi24 = details.get("oi_24h")
+                                max_short_oi = max(
+                                    [v for v in (oi1, oi2) if v is not None] or [0.0]
+                                )
+                                max_long_oi = max(
+                                    [v for v in (oi4, oi6, oi24) if v is not None] or [0.0]
+                                )
+                                if max_long_oi < 5.0 and max_short_oi < 3.0:
+                                    continue
+
                                 if score < STEALTH_MIN_SCORE and not early_flag:
                                     continue
                                 if score < STEALTH_MIN_SCORE and early_flag:
