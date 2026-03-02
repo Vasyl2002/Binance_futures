@@ -152,6 +152,7 @@ async def compute_stealth_squeeze_score(
     # --- Simple 5m OI + L/S (extra early flag) ---
     try:
         oi_5m = await get_open_interest_hist(session, symbol, period="5m", limit=SIMPLE_5M_LIMIT)
+        # get_top_long_short_account_ratio возвращает уже float по последнему бару
         ls_5m = await get_top_long_short_account_ratio(session, symbol, period="5m", limit=2)
     except Exception:
         oi_5m, ls_5m = None, None
@@ -168,7 +169,7 @@ async def compute_stealth_squeeze_score(
                 inc_streak += 1
             else:
                 break
-        ls_val = float(ls_5m[-1].get("longShortRatio", 0) or 0) if ls_5m else 1.0
+        ls_val = float(ls_5m) if ls_5m is not None else 1.0
         if (
             simple_oi_pct is not None
             and simple_oi_pct >= SIMPLE_5M_OI_MIN_PCT
