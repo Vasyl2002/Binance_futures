@@ -185,6 +185,9 @@ async def compute_stealth_squeeze_score(
     oi_1h = await get_open_interest_hist(session, symbol, period="1h", limit=4)
     if oi_1h and len(oi_1h) >= 3:
         accel_1h = _oi_acceleration(oi_1h)
+        oi_d1h = _oi_delta_pct(oi_1h, 1)
+        if oi_d1h is not None:
+            details["oi_1h"] = oi_d1h
         if accel_1h is not None:
             details["accel_1h"] = accel_1h
             if accel_1h >= EARLY_1H_ACCEL_MIN:
@@ -196,6 +199,9 @@ async def compute_stealth_squeeze_score(
     oi_2h = await get_open_interest_hist(session, symbol, period="2h", limit=4)
     if oi_2h and len(oi_2h) >= 3:
         accel_2h = _oi_acceleration(oi_2h)
+        oi_d2h = _oi_delta_pct(oi_2h, 1)
+        if oi_d2h is not None:
+            details["oi_2h"] = oi_d2h
         if accel_2h is not None:
             details["accel_2h"] = accel_2h
             if accel_2h >= EARLY_2H_ACCEL_MIN:
